@@ -1,0 +1,24 @@
+[package]
+name = "miro-common"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+tokio.workspace = true
+
+quinn.workspace = true
+h3.workspace = true
+h3-quinn.workspace = true
+axum.workspace = true
+
+
+tracing.workspace = true
+thiserror.workspace = true
+
+
+# own dependencies
+rand = "0.8"
+bytes = "1.6"
+quinn-proto = "0.10"
