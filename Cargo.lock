@@ -488,7 +488,6 @@ dependencies = [
  "h3",
  "h3-quinn",
  "quinn",
- "quinn-proto",
  "rand",
  "thiserror",
  "tokio",

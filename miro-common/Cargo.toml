@@ -21,4 +21,3 @@ thiserror.workspace = true
 # own dependencies
 rand = "0.8"
 bytes = "1.6"
-quinn-proto = "0.10"

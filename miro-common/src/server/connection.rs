@@ -1,12 +1,12 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, vec};
 
 use axum::http::{Method, Request, Response, Version};
-use bytes::{Buf, BufMut, Bytes};
+use bytes::{BufMut, Bytes};
 use quinn::VarInt;
-use quinn_proto::coding::Codec;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::{
+    utils::{AsyncReadStreamExt, BufMutExt},
     ClientHandshake, CommonError, ProxyAddress, ServerHandshake, TcpRequest, TcpResponse,
     AUTH_RESPONSE_PADDING, CLIENT_TCP_REQUEST_ID, HANDSHAKE_HEADER_AUTH, HANDSHAKE_HEADER_CC_RX,
     HANDSHAKE_HEADER_PADDING, HANDSHAKE_HEADER_UDP, HANDSHAKE_HOST, HANDSHAKE_PATH,
@@ -44,7 +44,7 @@ impl Connection {
                 tracing::info!("Stream ID: {:?}", stream.id());
                 tracing::debug!("Received request: {:?}", request);
 
-                let client_handshake = match client_handshake(request.clone()).await {
+                let client_handshake = match client_handshake(request.clone()) {
                     Ok(handshake) => handshake,
                     Err(e) => {
                         tracing::warn!("Client handshake failed: {:?}, serve the connection as a HTTP connection.", e);
@@ -82,7 +82,7 @@ impl Connection {
 
 type ClientHandshakeError = Cow<'static, str>;
 
-async fn client_handshake<T>(request: Request<T>) -> Result<ClientHandshake, ClientHandshakeError> {
+fn client_handshake<T>(request: Request<T>) -> Result<ClientHandshake, ClientHandshakeError> {
     let (parts, _) = request.into_parts();
     if parts.method != Method::POST {
         return Err(format!("Invalid method: {}", parts.method).into());
@@ -143,7 +143,6 @@ async fn serve_masquerading_http<S: h3::quic::SendStream<B>, B: bytes::Buf>(
         tracing::debug!("Received request: {:?}", request);
         send_404(stream).await?;
     }
-    connection.shutdown(0).await.map_err(CommonError::from)?;
     Ok(())
 }
 
@@ -177,6 +176,7 @@ async fn server_handshake<S: h3::quic::SendStream<B>, B: bytes::Buf>(
         .send_response(response)
         .await
         .map_err(CommonError::from)?;
+    stream.finish().await.map_err(CommonError::from)?;
     Ok(())
 }
 
@@ -189,7 +189,7 @@ async fn process_tcp_request_message(
     tracing::debug!("Received TCP request: {:?}", request);
     let response = TcpResponse {
         status: SERVER_TCP_RESPONSE_STATUS_OK,
-        message: "Hello, world!".into(),
+        message: "Miro".into(),
     };
     send_tcp_response_message(&mut send_stream, response).await?;
     tracing::error!("TCP proxy not implemented yet");
@@ -200,51 +200,28 @@ async fn process_tcp_request_message(
 async fn read_tcp_request_message(
     stream: &mut (impl AsyncRead + Unpin),
 ) -> Result<TcpRequest, Error> {
-    let mut buf = bytes::BytesMut::zeroed(16);
-    stream
-        .read_exact(&mut buf)
-        .await
-        .map_err(CommonError::from)?;
-    let mut buf = buf.freeze();
-    let status = VarInt::decode(&mut buf).map_err(|e| Error::TcpMessageError(format!("{}", e)))?;
-    if status != CLIENT_TCP_REQUEST_ID {
+    let status = stream.read_varint().await?;
+    if status != CLIENT_TCP_REQUEST_ID.into_inner() {
         return Err(Error::TcpMessageError(format!(
             "Invalid request ID: {}",
             status
         )));
     }
-    let address_len =
-        VarInt::decode(&mut buf).map_err(|e| Error::TcpMessageError(format!("{}", e)))?;
-    if address_len <= VarInt::from_u32(0) {
+    let address_len = stream.read_varint().await? as usize;
+    if address_len == 0 {
         return Err(Error::TcpMessageError("Invalid address length".into()));
     }
-    let mut address_buf = bytes::BytesMut::with_capacity(address_len.into_inner() as usize);
-    let remaining_size = buf.remaining();
-    address_buf.put(buf.chunk());
-    address_buf.resize(address_buf.capacity(), 0);
-
+    let mut buf = vec![0u8; address_len];
     stream
-        .read_exact(&mut address_buf[remaining_size..])
+        .read_exact(&mut buf)
         .await
         .map_err(CommonError::from)?;
-    let address_buf = address_buf.freeze();
-    let address: ProxyAddress = String::from_utf8(address_buf.to_vec())
+    let address: ProxyAddress = String::from_utf8(buf)
         .map_err(|_| Error::TcpMessageError("Invalid address".into()))?
         .parse()
         .map_err(|_| Error::TcpMessageError("Invalid address".into()))?;
-    let mut padding_len_buf = bytes::BytesMut::zeroed(8);
-    stream
-        .read_buf(&mut padding_len_buf)
-        .await
-        .map_err(CommonError::from)?;
-    let mut padding_len_buf = padding_len_buf.freeze();
-    let padding_len = VarInt::decode(&mut padding_len_buf)
-        .map_err(|e| Error::TcpMessageError(format!("{}", e)))?;
-    if padding_len <= VarInt::from_u32(0) {
-        return Err(Error::TcpMessageError("Invalid padding length".into()));
-    }
-    let mut padding_buf =
-        bytes::BytesMut::zeroed(padding_len.into_inner() as usize - padding_len_buf.remaining());
+    let padding_len = stream.read_varint().await?;
+    let mut padding_buf = vec![0u8; padding_len as usize];
     stream
         .read_exact(&mut padding_buf)
         .await
@@ -262,14 +239,237 @@ async fn send_tcp_response_message(
     let message = response.message.as_bytes();
     let message_len = VarInt::from_u64(message.len() as u64)
         .map_err(|e| Error::TcpMessageError(format!("{}", e)))?;
-    message_len.encode(&mut buf);
+    buf.put_varint(message_len);
     buf.put(message);
     let padding = TCP_RESPONSE_PADDING.generate();
     let padding_bytes = padding.as_bytes();
     let padding_len = VarInt::from_u64(padding_bytes.len() as u64)
         .map_err(|e| Error::TcpMessageError(format!("{}", e)))?;
-    padding_len.encode(&mut buf);
+    buf.put_varint(padding_len);
     buf.put(padding_bytes);
     stream.write_all(&buf).await.map_err(CommonError::from)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod client_handshake_tests {
+        use super::*;
+        #[test]
+        fn test_client_handshake() {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("http://hysteria:8080/auth")
+                .header(HANDSHAKE_HEADER_AUTH, "Hello")
+                .header(HANDSHAKE_HEADER_CC_RX, "10")
+                .header(HANDSHAKE_HEADER_PADDING, "Hello")
+                .body(())
+                .unwrap();
+            let handshake = client_handshake(request).unwrap();
+            assert_eq!(handshake.auth, "Hello");
+            assert_eq!(handshake.cc_rx, 10);
+        }
+
+        #[test]
+        fn test_client_handshake_invalid_method() {
+            let request = Request::builder()
+                .method(Method::GET)
+                .uri("http://hysteria:8080/auth")
+                .header(HANDSHAKE_HEADER_AUTH, "Hello")
+                .header(HANDSHAKE_HEADER_CC_RX, "10")
+                .header(HANDSHAKE_HEADER_PADDING, "Hello")
+                .body(())
+                .unwrap();
+            let handshake = client_handshake(request);
+            assert!(matches!(handshake, Err(e) if e == "Invalid method: GET"));
+        }
+
+        #[test]
+        fn test_client_handshake_invalid_host() {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("http://localhost:8080/auth")
+                .header(HANDSHAKE_HEADER_AUTH, "Hello")
+                .header(HANDSHAKE_HEADER_CC_RX, "10")
+                .header(HANDSHAKE_HEADER_PADDING, "Hello")
+                .body(())
+                .unwrap();
+            let handshake = client_handshake(request);
+            assert!(matches!(handshake, Err(e) if e == "Invalid host: Some(\"localhost\")"));
+        }
+
+        #[test]
+        fn test_client_handshake_invalid_path() {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri("http://hysteria:8080/handshake/invalid")
+                .header(HANDSHAKE_HEADER_AUTH, "Hello")
+                .header(HANDSHAKE_HEADER_CC_RX, "10")
+                .header(HANDSHAKE_HEADER_PADDING, "Hello")
+                .body(())
+                .unwrap();
+            let handshake = client_handshake(request);
+            assert!(
+                matches!(handshake, Err(e) if e.starts_with("Invalid path: \"/handshake/invalid\""))
+            );
+        }
+    }
+
+    mod server_handshake_tests {
+        use super::*;
+        #[test]
+        fn test_server_handshake() {
+            let response = ServerHandshake {
+                udp: true,
+                cc_rx: crate::ServerMaxReceiveRate::Auto,
+            };
+            let response = build_server_handshake(response);
+            assert_eq!(response.status(), HANDSHAKE_STATUS_OK);
+            assert_eq!(
+                response.headers().get(HANDSHAKE_HEADER_UDP).unwrap(),
+                "true"
+            );
+            assert_eq!(
+                response.headers().get(HANDSHAKE_HEADER_CC_RX).unwrap(),
+                "auto"
+            );
+        }
+
+        #[test]
+        fn test_server_handshake_udp() {
+            let response = ServerHandshake {
+                udp: false,
+                cc_rx: crate::ServerMaxReceiveRate::Auto,
+            };
+            let response = build_server_handshake(response);
+            assert_eq!(response.status(), HANDSHAKE_STATUS_OK);
+            assert_eq!(
+                response.headers().get(HANDSHAKE_HEADER_UDP).unwrap(),
+                "false"
+            );
+            assert_eq!(
+                response.headers().get(HANDSHAKE_HEADER_CC_RX).unwrap(),
+                "auto"
+            );
+        }
+
+        #[test]
+        fn test_server_handshake_cc_rx() {
+            let response = ServerHandshake {
+                udp: true,
+                cc_rx: crate::ServerMaxReceiveRate::Specified(10),
+            };
+            let response = build_server_handshake(response);
+            assert_eq!(response.status(), HANDSHAKE_STATUS_OK);
+            assert_eq!(
+                response.headers().get(HANDSHAKE_HEADER_UDP).unwrap(),
+                "true"
+            );
+            assert_eq!(
+                response.headers().get(HANDSHAKE_HEADER_CC_RX).unwrap(),
+                "10"
+            );
+        }
+    }
+
+    mod read_tcp_request_message_tests {
+        use std::io::Cursor;
+
+        use crate::TCP_REQUEST_PADDING;
+
+        use super::*;
+        #[tokio::test]
+        async fn test_read_tcp_request_message() {
+            let mut buf = bytes::BytesMut::new();
+            buf.put_varint(CLIENT_TCP_REQUEST_ID);
+            buf.put_varint(VarInt::from_u32(10));
+            buf.put_slice(b"test.cc:80");
+            let padding = TCP_REQUEST_PADDING.generate();
+            let padding_bytes = padding.as_bytes();
+            buf.put_varint(VarInt::from_u64(padding_bytes.len() as u64).unwrap());
+            buf.put(padding_bytes);
+            let mut stream = Cursor::new(buf.freeze());
+            let request = read_tcp_request_message(&mut stream).await.unwrap();
+            assert_eq!(request.address, "test.cc:80".parse().unwrap());
+        }
+
+        #[tokio::test]
+        async fn test_read_tcp_request_message_invalid_request_id() {
+            let mut buf = bytes::BytesMut::new();
+            buf.put_varint(VarInt::from_u64(0).unwrap());
+            buf.put_varint(VarInt::from_u32(10));
+            buf.put_slice(b"test.cc:80");
+            let padding = TCP_REQUEST_PADDING.generate();
+            let padding_bytes = padding.as_bytes();
+            buf.put_varint(VarInt::from_u64(padding_bytes.len() as u64).unwrap());
+            buf.put(padding_bytes);
+            let mut stream = Cursor::new(buf.freeze());
+            let request = read_tcp_request_message(&mut stream).await;
+            assert!(matches!(request, Err(Error::TcpMessageError(e)) if e == "Invalid request ID: 0"));
+        }
+
+        #[tokio::test]
+        async fn test_read_tcp_request_message_invalid_address_length() {
+            let mut buf = bytes::BytesMut::new();
+            buf.put_varint(CLIENT_TCP_REQUEST_ID);
+            buf.put_varint(VarInt::from_u64(0).unwrap());
+            let padding = TCP_REQUEST_PADDING.generate();
+            let padding_bytes = padding.as_bytes();
+            buf.put_varint(VarInt::from_u64(padding_bytes.len() as u64).unwrap());
+            buf.put(padding_bytes);
+            let mut stream = Cursor::new(buf.freeze());
+            let request = read_tcp_request_message(&mut stream).await;
+            assert!(matches!(request, Err(Error::TcpMessageError(e)) if e == "Invalid address length"));
+        }
+
+        #[tokio::test]
+        async fn test_read_tcp_request_message_invalid_address() {
+            let mut buf = bytes::BytesMut::new();
+            buf.put_varint(CLIENT_TCP_REQUEST_ID);
+            buf.put_varint(VarInt::from_u32(11));
+            buf.put_slice(b"test.cc:80\xFF");
+            let padding = TCP_REQUEST_PADDING.generate();
+            let padding_bytes = padding.as_bytes();
+            buf.put_varint(VarInt::from_u64(padding_bytes.len() as u64).unwrap());
+            buf.put(padding_bytes);
+            let mut stream = Cursor::new(buf.freeze());
+            let request = read_tcp_request_message(&mut stream).await;
+            assert!(matches!(request, Err(Error::TcpMessageError(e)) if e == "Invalid address"));
+        }
+    }
+
+    mod send_tcp_response_message_tests {
+        use std::io::Cursor;
+
+        use bytes::Buf;
+
+        use super::*;
+
+        #[tokio::test]
+        async fn test_send_tcp_response_message() {
+            let mut buf = vec![0u8; 2048];
+            let response = TcpResponse {
+                status: SERVER_TCP_RESPONSE_STATUS_OK,
+                message: "Hello".into(),
+            };
+            let mut stream = Cursor::new(&mut buf[..]);
+            send_tcp_response_message(&mut stream, response).await.unwrap();
+            let mut stream = Cursor::new(buf);
+            let status = stream.read_u8().await.unwrap();
+            assert_eq!(status, SERVER_TCP_RESPONSE_STATUS_OK);
+            let message_len = stream.read_varint().await.unwrap();
+            let mut message_buf = vec![0u8; message_len as usize];
+            stream.read_exact(&mut message_buf).await.unwrap();
+            let message = String::from_utf8(message_buf).unwrap();
+            assert_eq!(message, "Hello");
+            let padding_len = stream.read_varint().await.unwrap();
+            let mut padding_buf = vec![0u8; padding_len as usize];
+            stream.read_exact(&mut padding_buf).await.unwrap();
+            while stream.has_remaining() {
+                assert_eq!(stream.read_u8().await.unwrap(), 0);
+            }
+        }
+    }
 }

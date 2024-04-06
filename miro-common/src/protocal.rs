@@ -1,6 +1,6 @@
 use quinn::VarInt;
 use std::{
-    net::{Ipv4Addr, Ipv6Addr},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     num::ParseIntError,
     str::FromStr,
 };
@@ -154,19 +154,55 @@ impl FromStr for ProxyAddress {
     type Err = ParseAddressError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut parts = s.split(':');
-        let host = parts
-            .next()
-            .ok_or_else(|| ParseAddressError::InvalidHost(s.to_string()))?;
-        let port = parts
-            .next()
-            .ok_or_else(|| ParseAddressError::InvalidPort(s.to_string()))?;
+        if let Ok(address) = SocketAddr::from_str(s) {
+            return match address {
+                SocketAddr::V4(v4) => Ok(ProxyAddress::new(ProxyHost::IpV4(*v4.ip()), v4.port())),
+                SocketAddr::V6(v6) => Ok(ProxyAddress::new(ProxyHost::IpV6(*v6.ip()), v6.port())),
+            };
+        }
+        let parts = s
+            .rfind(':')
+            .ok_or_else(|| ParseAddressError::InvalidAddress(s.to_string()))?;
+        if parts == 0 {
+            return Err(ParseAddressError::InvalidAddress(s.to_string()));
+        }
+        if parts == s.len() - 1 {
+            return Err(ParseAddressError::InvalidAddress(s.to_string()));
+        }
+        let host = &s[..parts];
+        let port = &s[parts + 1..];
         let port = port
             .parse::<u16>()
             .map_err(|_| ParseAddressError::InvalidPort(s.to_string()))?;
-        if parts.next().is_some() {
-            return Err(ParseAddressError::InvalidAddress(s.to_string()));
-        }
-        Ok(ProxyAddress::new(host.into(), port))
+        Ok(ProxyAddress::new(ProxyHost::Domain(host.into()), port))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_address() {
+        let address = "test.cc:233".parse::<ProxyAddress>().unwrap();
+        assert_eq!(address.host, ProxyHost::Domain("test.cc".to_string()));
+        assert_eq!(address.port, 233);
+    }
+
+    #[test]
+    fn test_parse_address_ipv4() {
+        let address = "192.168.1.1:233".parse::<ProxyAddress>().unwrap();
+        assert_eq!(address.host, ProxyHost::IpV4(Ipv4Addr::new(192, 168, 1, 1)));
+        assert_eq!(address.port, 233);
+    }
+
+    #[test]
+    fn test_parse_address_ipv6() {
+        let address = "[2001:db8::1]:233".parse::<ProxyAddress>().unwrap();
+        assert_eq!(
+            address.host,
+            ProxyHost::IpV6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))
+        );
+        assert_eq!(address.port, 233);
     }
 }
