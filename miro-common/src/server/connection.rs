@@ -1,13 +1,14 @@
-use std::{borrow::Cow, vec};
+use std::borrow::Cow;
 
 use axum::http::{Method, Request, Response, Version};
 use bytes::{BufMut, Bytes};
-use quinn::VarInt;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::{
-    utils::{AsyncReadStreamExt, BufMutExt},
-    ClientHandshake, CommonError, ProxyAddress, ServerHandshake, TcpRequest, TcpResponse,
+    datagram::DatagramSessionManager,
+    utils::{AsyncReadStreamExt, BufExt, BufMutExt},
+    ClientHandshake, CommonError, DatagramFrame, ServerHandshake, TcpRequest, TcpResponse,
     AUTH_RESPONSE_PADDING, CLIENT_TCP_REQUEST_ID, HANDSHAKE_HEADER_AUTH, HANDSHAKE_HEADER_CC_RX,
     HANDSHAKE_HEADER_PADDING, HANDSHAKE_HEADER_UDP, HANDSHAKE_HOST, HANDSHAKE_PATH,
     HANDSHAKE_STATUS_OK, SERVER_TCP_RESPONSE_STATUS_OK, TCP_RESPONSE_PADDING,
@@ -19,13 +20,17 @@ use super::{Authentication, ConnectionConfig, ConnectionConfigBuilder, Error};
 pub struct Connection {
     conn: quinn::Connection,
     config: ConnectionConfig,
+    cache: DatagramSessionManager,
 }
 
 impl Connection {
     pub fn new(conn: quinn::Connection) -> Self {
+        let config = ConnectionConfigBuilder::new(Authentication::new_password("Hello")).build();
+        let idle_timeout = config.idle_timeout;
         Self {
             conn,
-            config: ConnectionConfigBuilder::new(Authentication::new_password("Hello")).build(),
+            config,
+            cache: DatagramSessionManager::new(idle_timeout),
         }
     }
 }
@@ -59,13 +64,23 @@ impl Connection {
                 }
                 tracing::debug!("Client authentication succeeded: {:?}", client_handshake);
                 server_handshake(stream, &self.config).await?;
-                tracing::debug!("Handshake completed, serve the connection as a TCP connection.");
+                tracing::info!(
+                    "Handshake completed, serve the connection as a Hysteria connection. Ip: {}",
+                    self.conn.remote_address()
+                );
                 drop(h3_conn);
                 loop {
-                    let (send_stream, recv_stream) =
-                        self.conn.accept_bi().await.map_err(CommonError::from)?;
+                    tokio::select! {
+                        stream = self.conn.accept_bi() =>  {
+                            let (mut send_stream, mut recv_stream) = stream.map_err(CommonError::from)?;
+                            process_tcp_request_message(&mut recv_stream, &mut send_stream).await?;
 
-                    process_tcp_request_message(recv_stream, send_stream).await?;
+                        }
+                        datagram = self.conn.read_datagram() => {
+                            let datagram = datagram.map_err(CommonError::from)?;
+                            process_udp_message(&self.cache, datagram).await?;
+                        }
+                    }
                 }
             }
             Ok(None) => {
@@ -207,25 +222,8 @@ async fn read_tcp_request_message(
             status
         )));
     }
-    let address_len = stream.read_varint().await? as usize;
-    if address_len == 0 {
-        return Err(Error::TcpMessageError("Invalid address length".into()));
-    }
-    let mut buf = vec![0u8; address_len];
-    stream
-        .read_exact(&mut buf)
-        .await
-        .map_err(CommonError::from)?;
-    let address: ProxyAddress = String::from_utf8(buf)
-        .map_err(|_| Error::TcpMessageError("Invalid address".into()))?
-        .parse()
-        .map_err(|_| Error::TcpMessageError("Invalid address".into()))?;
-    let padding_len = stream.read_varint().await?;
-    let mut padding_buf = vec![0u8; padding_len as usize];
-    stream
-        .read_exact(&mut padding_buf)
-        .await
-        .map_err(CommonError::from)?;
+    let address = stream.read_proxy_address().await?;
+    stream.read_padding().await?;
     Ok(TcpRequest { address })
 }
 
@@ -237,26 +235,66 @@ async fn send_tcp_response_message(
     let mut buf = bytes::BytesMut::with_capacity(2048);
     buf.put_u8(response.status);
     let message = response.message.as_bytes();
-    let message_len = VarInt::from_u64(message.len() as u64)
-        .map_err(|e| Error::TcpMessageError(format!("{}", e)))?;
-    buf.put_varint(message_len);
-    buf.put(message);
-    let padding = TCP_RESPONSE_PADDING.generate();
-    let padding_bytes = padding.as_bytes();
-    let padding_len = VarInt::from_u64(padding_bytes.len() as u64)
-        .map_err(|e| Error::TcpMessageError(format!("{}", e)))?;
-    buf.put_varint(padding_len);
-    buf.put(padding_bytes);
+    buf.put_variable_slice(message)?;
+    buf.put_padding(TCP_RESPONSE_PADDING)?;
     stream.write_all(&buf).await.map_err(CommonError::from)?;
     Ok(())
 }
 
+#[tracing::instrument(level = "debug", skip(cache, message))]
+async fn process_udp_message(cache: &DatagramSessionManager, message: Bytes) -> Result<(), Error> {
+    let frame = read_datagram_frame(message)?;
+    if let Some(_data) = cache
+        .insert_and_try_collect(
+            frame.session_id,
+            frame.packet_id,
+            frame.frame_id,
+            frame.payload,
+            frame.frame_count,
+        )
+        .await
+    {
+        tracing::info!(
+            "Received all frames for session_id: {}, packet_id: {}",
+            frame.session_id,
+            frame.packet_id
+        );
+        tracing::error!("UDP proxy not implemented yet");
+        // TODO: Implement UDP proxy
+        // let socket = cache.get_socket(frame.session_id, frame.address).await?;
+        // socket.send_to(&data, frame.address).await?;
+    }
+    Ok(())
+}
+
+fn read_datagram_frame(mut message: Bytes) -> Result<DatagramFrame, Error> {
+    let session_id = message.read_u32()?;
+    let packet_id = message.read_u16()?;
+    let frame_id = message.read_u8()?;
+    let frame_count = message.read_u8()?;
+    let address = message.read_proxy_address()?;
+    Ok(DatagramFrame {
+        session_id,
+        packet_id,
+        frame_id,
+        frame_count,
+        address,
+        payload: message,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     mod client_handshake_tests {
-        use super::*;
+
+        use crate::{
+            server::connection::client_handshake, HANDSHAKE_HEADER_AUTH, HANDSHAKE_HEADER_CC_RX,
+            HANDSHAKE_HEADER_PADDING,
+        };
+        use axum::http::Method;
+        use axum::http::Request;
+
         #[test]
         fn test_client_handshake() {
             let request = Request::builder()
@@ -318,7 +356,11 @@ mod tests {
     }
 
     mod server_handshake_tests {
-        use super::*;
+        use crate::{
+            server::connection::build_server_handshake, ServerHandshake, HANDSHAKE_HEADER_CC_RX,
+            HANDSHAKE_HEADER_UDP, HANDSHAKE_STATUS_OK,
+        };
+
         #[test]
         fn test_server_handshake() {
             let response = ServerHandshake {
@@ -377,19 +419,20 @@ mod tests {
     mod read_tcp_request_message_tests {
         use std::io::Cursor;
 
-        use crate::TCP_REQUEST_PADDING;
+        use quinn::VarInt;
 
-        use super::*;
+        use crate::{
+            server::{connection::read_tcp_request_message, Error},
+            utils::BufMutExt,
+            CLIENT_TCP_REQUEST_ID, TCP_REQUEST_PADDING,
+        };
+
         #[tokio::test]
         async fn test_read_tcp_request_message() {
             let mut buf = bytes::BytesMut::new();
             buf.put_varint(CLIENT_TCP_REQUEST_ID);
-            buf.put_varint(VarInt::from_u32(10));
-            buf.put_slice(b"test.cc:80");
-            let padding = TCP_REQUEST_PADDING.generate();
-            let padding_bytes = padding.as_bytes();
-            buf.put_varint(VarInt::from_u64(padding_bytes.len() as u64).unwrap());
-            buf.put(padding_bytes);
+            buf.put_variable_slice(b"test.cc:80").unwrap();
+            buf.put_padding(TCP_REQUEST_PADDING).unwrap();
             let mut stream = Cursor::new(buf.freeze());
             let request = read_tcp_request_message(&mut stream).await.unwrap();
             assert_eq!(request.address, "test.cc:80".parse().unwrap());
@@ -399,15 +442,13 @@ mod tests {
         async fn test_read_tcp_request_message_invalid_request_id() {
             let mut buf = bytes::BytesMut::new();
             buf.put_varint(VarInt::from_u64(0).unwrap());
-            buf.put_varint(VarInt::from_u32(10));
-            buf.put_slice(b"test.cc:80");
-            let padding = TCP_REQUEST_PADDING.generate();
-            let padding_bytes = padding.as_bytes();
-            buf.put_varint(VarInt::from_u64(padding_bytes.len() as u64).unwrap());
-            buf.put(padding_bytes);
+            buf.put_variable_slice(b"test.cc:80").unwrap();
+            buf.put_padding(TCP_REQUEST_PADDING).unwrap();
             let mut stream = Cursor::new(buf.freeze());
             let request = read_tcp_request_message(&mut stream).await;
-            assert!(matches!(request, Err(Error::TcpMessageError(e)) if e == "Invalid request ID: 0"));
+            assert!(
+                matches!(request, Err(Error::TcpMessageError(e)) if e == "Invalid request ID: 0")
+            );
         }
 
         #[tokio::test]
@@ -415,25 +456,20 @@ mod tests {
             let mut buf = bytes::BytesMut::new();
             buf.put_varint(CLIENT_TCP_REQUEST_ID);
             buf.put_varint(VarInt::from_u64(0).unwrap());
-            let padding = TCP_REQUEST_PADDING.generate();
-            let padding_bytes = padding.as_bytes();
-            buf.put_varint(VarInt::from_u64(padding_bytes.len() as u64).unwrap());
-            buf.put(padding_bytes);
+            buf.put_padding(TCP_REQUEST_PADDING).unwrap();
             let mut stream = Cursor::new(buf.freeze());
             let request = read_tcp_request_message(&mut stream).await;
-            assert!(matches!(request, Err(Error::TcpMessageError(e)) if e == "Invalid address length"));
+            assert!(
+                matches!(request, Err(Error::TcpMessageError(e)) if e == "Invalid address length")
+            );
         }
 
         #[tokio::test]
         async fn test_read_tcp_request_message_invalid_address() {
             let mut buf = bytes::BytesMut::new();
             buf.put_varint(CLIENT_TCP_REQUEST_ID);
-            buf.put_varint(VarInt::from_u32(11));
-            buf.put_slice(b"test.cc:80\xFF");
-            let padding = TCP_REQUEST_PADDING.generate();
-            let padding_bytes = padding.as_bytes();
-            buf.put_varint(VarInt::from_u64(padding_bytes.len() as u64).unwrap());
-            buf.put(padding_bytes);
+            buf.put_variable_slice(b"test.cc:80\xFF").unwrap();
+            buf.put_padding(TCP_REQUEST_PADDING).unwrap();
             let mut stream = Cursor::new(buf.freeze());
             let request = read_tcp_request_message(&mut stream).await;
             assert!(matches!(request, Err(Error::TcpMessageError(e)) if e == "Invalid address"));
@@ -444,8 +480,12 @@ mod tests {
         use std::io::Cursor;
 
         use bytes::Buf;
+        use tokio::io::AsyncReadExt;
 
-        use super::*;
+        use crate::{
+            server::connection::send_tcp_response_message, utils::AsyncReadStreamExt, TcpResponse,
+            SERVER_TCP_RESPONSE_STATUS_OK,
+        };
 
         #[tokio::test]
         async fn test_send_tcp_response_message() {
@@ -455,7 +495,9 @@ mod tests {
                 message: "Hello".into(),
             };
             let mut stream = Cursor::new(&mut buf[..]);
-            send_tcp_response_message(&mut stream, response).await.unwrap();
+            send_tcp_response_message(&mut stream, response)
+                .await
+                .unwrap();
             let mut stream = Cursor::new(buf);
             let status = stream.read_u8().await.unwrap();
             assert_eq!(status, SERVER_TCP_RESPONSE_STATUS_OK);
@@ -464,9 +506,7 @@ mod tests {
             stream.read_exact(&mut message_buf).await.unwrap();
             let message = String::from_utf8(message_buf).unwrap();
             assert_eq!(message, "Hello");
-            let padding_len = stream.read_varint().await.unwrap();
-            let mut padding_buf = vec![0u8; padding_len as usize];
-            stream.read_exact(&mut padding_buf).await.unwrap();
+            stream.read_padding().await.unwrap();
             while stream.has_remaining() {
                 assert_eq!(stream.read_u8().await.unwrap(), 0);
             }

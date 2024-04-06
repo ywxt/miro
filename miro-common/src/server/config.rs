@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use crate::ServerMaxReceiveRate;
 
 use super::Authentication;
@@ -6,6 +8,7 @@ use super::Authentication;
 pub struct ConnectionConfig {
     pub cc_rx: ServerMaxReceiveRate,
     pub udp: bool,
+    pub idle_timeout: Duration,
     auth: Authentication,
 }
 
@@ -18,6 +21,7 @@ impl ConnectionConfig {
 pub struct ConnectionConfigBuilder {
     cc_rx: Option<ServerMaxReceiveRate>,
     udp: bool,
+    idle_timeout: Duration,
     auth: Authentication,
 }
 
@@ -26,6 +30,7 @@ impl ConnectionConfigBuilder {
         Self {
             cc_rx: None,
             udp: false,
+            idle_timeout: Duration::from_secs(60),
             auth,
         }
     }
@@ -45,10 +50,16 @@ impl ConnectionConfigBuilder {
         self
     }
 
+    pub fn idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        self.idle_timeout = idle_timeout;
+        self
+    }
+
     pub fn build(self) -> ConnectionConfig {
         ConnectionConfig {
             cc_rx: self.cc_rx.unwrap_or(ServerMaxReceiveRate::Auto),
             udp: self.udp,
+            idle_timeout: self.idle_timeout,
             auth: self.auth,
         }
     }

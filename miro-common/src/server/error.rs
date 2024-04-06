@@ -11,7 +11,7 @@ pub enum Error {
     #[error("Client authentication failed")]
     ClientAuthError,
 
-    #[error("Client TCP request message error: {0}")]
+    #[error("TCP message error: {0}")]
     TcpMessageError(String),
 
     #[error("{0}")]

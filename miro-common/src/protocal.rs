@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use quinn::VarInt;
 use std::{
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -62,6 +63,19 @@ pub struct ServerHandshake {
 pub struct TcpResponse {
     pub status: u8,
     pub message: String,
+}
+
+pub type DatagramSessionId = u32;
+pub type DatagramPacketId = u16;
+
+#[derive(Clone, Debug)]
+pub struct DatagramFrame {
+    pub session_id: u32,
+    pub packet_id: u16,
+    pub frame_id: u8,
+    pub frame_count: u8,
+    pub address: ProxyAddress,
+    pub payload: Bytes,
 }
 
 #[derive(Clone, Debug)]
