@@ -9,7 +9,7 @@ use quinn::Endpoint;
 use rustls::{Certificate, PrivateKey, RootCertStore};
 
 static ALPN: &[u8] = b"h3";
-const SERVER_ADDRESS: &str = "127.0.0.1:14567";
+const LOCAL_ADDRESS: &str = "127.0.0.1:0";
 fn create_server() -> Server {
     let cert = "tests/server.cert";
     let key = "tests/server.key";
@@ -28,7 +28,7 @@ fn create_server() -> Server {
     tls_config.alpn_protocols = vec![ALPN.into()];
 
     let server_config = quinn::ServerConfig::with_crypto(Arc::new(tls_config));
-    let endpoint = quinn::Endpoint::server(server_config, SERVER_ADDRESS.parse().unwrap()).unwrap();
+    let endpoint = quinn::Endpoint::server(server_config, LOCAL_ADDRESS.parse().unwrap()).unwrap();
     Server::new(endpoint)
 }
 
@@ -49,7 +49,7 @@ fn create_client() -> Endpoint {
     tls_config.alpn_protocols = vec![ALPN.into()];
 
     let mut client_endpoint =
-        h3_quinn::quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        h3_quinn::quinn::Endpoint::client(LOCAL_ADDRESS.parse().unwrap()).unwrap();
 
     let client_config = quinn::ClientConfig::new(Arc::new(tls_config));
     client_endpoint.set_default_client_config(client_config);
@@ -61,13 +61,14 @@ fn create_client() -> Endpoint {
 async fn test_server_handshake() {
     let server = create_server();
     let client = create_client();
+    let local_addr = server.local_addr().unwrap();
     let handler = tokio::spawn(async move {
         if let Ok(Some(conn)) = server.accept_connection().await {
              conn.process().await.unwrap();
         }
     });
     let conn = client
-        .connect(SERVER_ADDRESS.parse().unwrap(), "localhost")
+        .connect(local_addr, "localhost")
         .unwrap()
         .await
         .unwrap();
@@ -112,13 +113,14 @@ async fn test_server_handshake() {
 async fn test_server_invalid_handshake(){
     let server = create_server();
     let client = create_client();
+    let local_addr = server.local_addr().unwrap();
     let handler = tokio::spawn(async move {
         if let Ok(Some(conn)) = server.accept_connection().await {
              conn.process().await.unwrap();
         }
     });
     let conn = client
-        .connect(SERVER_ADDRESS.parse().unwrap(), "localhost")
+        .connect(local_addr, "localhost")
         .unwrap()
         .await
         .unwrap();

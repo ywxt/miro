@@ -8,6 +8,8 @@ pub use config::*;
 pub use connection::*;
 pub use error::Error;
 
+use std::{net::SocketAddr, sync::Arc};
+
 use quinn::Endpoint;
 
 use crate::CommonError;
@@ -32,5 +34,11 @@ impl Server {
         } else {
             Ok(None)
         }
+    }
+
+    pub fn local_addr(&self) -> Result<SocketAddr, CommonError> {
+        self.endpoint
+            .local_addr()
+            .map_err(|e| CommonError::IoError(Arc::new(e)))
     }
 }
