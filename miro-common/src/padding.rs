@@ -2,7 +2,7 @@ use rand::Rng;
 
 const PADDING_CHARS: &[u8; 62] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
-pub const AUTH_REQEUST_PADDING: Padding = Padding {
+pub const AUTH_REQUEST_PADDING: Padding = Padding {
     min: 256,
     max: 2048,
 };

@@ -1,16 +1,27 @@
-use std::{io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{future::Future, net::SocketAddr, sync::{atomic::{AtomicU16, Ordering}, Arc}, time::Duration};
 
-use bytes::{Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use moka::future::Cache;
 use tokio::{
     net::{ToSocketAddrs, UdpSocket},
-    sync::Mutex,
+    sync::{mpsc, Mutex},
 };
 
-use crate::{DatagramPacketId, DatagramSessionId};
+use crate::{utils::BoxFuture, CommonError, DatagramPacketId, DatagramSessionId, ProxyAddress};
+
+pub(crate) const MAX_DATAGRAM_CHANNEL_CAPACITY: usize = 32;
+pub(crate) const MAX_DATAGRAM_SOCKET_CAPACITY: u64 = 128;
 
 /// `(Session ID, Packet ID)`
 pub type PacketCachedID = (DatagramSessionId, DatagramPacketId);
+
+#[derive(Debug)]
+pub struct DatagramPacket {
+    pub session_id: DatagramSessionId,
+    pub packet_id: DatagramPacketId,
+    pub address: ProxyAddress,
+    pub payload: Bytes,
+}
 
 #[derive(Debug)]
 pub struct DatagramFrameQueue {
@@ -92,10 +103,10 @@ impl DatagramPacketCache {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DatagramSessionManager {
     recv_cache: Cache<DatagramSessionId, DatagramPacketCache>,
-    socket_cache: Cache<DatagramSessionId, Arc<DatagramSocket>>,
+    socket_cache: Cache<DatagramSessionId, mpsc::Sender<DatagramPacket>>,
     idle_timeout: Duration,
 }
 
@@ -103,7 +114,7 @@ impl DatagramSessionManager {
     pub fn new(idle_timeout: Duration) -> Self {
         Self {
             recv_cache: Cache::builder().time_to_idle(idle_timeout).build(),
-            socket_cache: Cache::builder().time_to_idle(idle_timeout).build(),
+            socket_cache: Cache::new(MAX_DATAGRAM_SOCKET_CAPACITY),
             idle_timeout,
         }
     }
@@ -127,43 +138,87 @@ impl DatagramSessionManager {
             .await
     }
 
-    pub async fn get_socket(
+    pub async fn get_sender(
         &self,
         session_id: DatagramSessionId,
-        bind_addr: SocketAddr,
-    ) -> Result<Arc<DatagramSocket>, Arc<io::Error>> {
-        self.socket_cache
-            .try_get_with(session_id, async {
-                DatagramSocket::bind(bind_addr).await.map(Arc::new)
+        init: impl Future<Output = Result<mpsc::Sender<DatagramPacket>, CommonError>>,
+    ) -> Result<mpsc::Sender<DatagramPacket>, Arc<CommonError>> {
+        self.socket_cache.try_get_with(session_id, init).await
+    }
+
+    pub(crate) fn get_session_invalidate_fn(
+        &self,
+    ) -> impl FnOnce(DatagramSessionId) -> BoxFuture<()> + Send + 'static {
+        let socket_cache = self.socket_cache.clone();
+        move |session_id| {
+            Box::pin(async move {
+                socket_cache.invalidate(&session_id).await;
             })
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DatagramSocket {
+    socket: Arc<UdpSocket>,
+}
+
+impl DatagramSocket {
+    pub async fn bind<A: ToSocketAddrs>(addr: A) -> Result<Self, CommonError> {
+        Ok(Self {
+            socket: Arc::new(
+                UdpSocket::bind(addr)
+                    .await
+                    .map_err(|e| CommonError::IoError(Arc::new(e)))?,
+            ),
+        })
+    }
+
+    pub async fn send_to(&self, mut buf: impl Buf, addr: SocketAddr) -> Result<(), CommonError> {
+        while buf.has_remaining() {
+            let len = self
+                .socket
+                .send_to(buf.chunk(), addr)
+                .await
+                .map_err(|e| CommonError::IoError(Arc::new(e)))?;
+            buf.advance(len);
+        }
+        Ok(())
+    }
+
+    pub async fn send_to_proxy_address(
+        &self,
+        buf: Bytes,
+        address: ProxyAddress,
+    ) -> Result<(), CommonError> {
+        self.send_to(buf, address.resolve().await?).await
+    }
+
+    pub async fn recv_from(&self) -> Result<(Bytes, SocketAddr), CommonError> {
+        let mut buf = BytesMut::zeroed(65536);
+        let (len, addr) = self
+            .socket
+            .recv_from(&mut buf[..])
             .await
+            .map_err(|e| CommonError::IoError(Arc::new(e)))?;
+        buf.truncate(len);
+        Ok((buf.freeze(), addr))
     }
 }
 
 #[derive(Debug)]
-pub struct DatagramSocket {
-    socket: UdpSocket,
+pub struct DatagramSender {
+    _conn: quinn::Connection,
+    recorded_packet_id: AtomicU16,
 }
 
-impl DatagramSocket {
-    pub async fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<Self> {
-        Ok(Self {
-            socket: UdpSocket::bind(addr).await?,
-        })
+impl DatagramSender {
+    pub fn new(conn: quinn::Connection) -> Self {
+        Self { _conn: conn, recorded_packet_id: AtomicU16::new(0) }
     }
-
-    pub async fn send_to<A: ToSocketAddrs + Clone>(&self, buf: &[u8], addr: A) -> io::Result<()> {
-        let mut send_len = 0;
-        while send_len < buf.len() {
-            let len = self.socket.send_to(&buf[send_len..], addr.clone()).await?;
-            send_len += len;
-        }
-        Ok(())
-    }
-    pub async fn recv_from(&self) -> io::Result<(Bytes, SocketAddr)> {
-        let mut buf = BytesMut::zeroed(65536);
-        let (len, addr) = self.socket.recv_from(&mut buf[..]).await?;
-        buf.truncate(len);
-        Ok((buf.freeze(), addr))
+    pub async fn send(&self, mut packet: DatagramPacket) -> Result<(), CommonError> {
+        let packet_id = self.recorded_packet_id.fetch_add(1, Ordering::SeqCst);
+        packet.packet_id = packet_id;
+        unimplemented!("QuicDatagramSender::send")
     }
 }

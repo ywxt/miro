@@ -1,17 +1,24 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, sync::Arc, time::Duration};
 
 use axum::http::{Method, Request, Response, Version};
 use bytes::{BufMut, Bytes};
 
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
+    net::TcpStream,
+    sync::mpsc::Receiver,
+};
 
 use crate::{
-    datagram::DatagramSessionManager,
-    utils::{AsyncReadStreamExt, BufExt, BufMutExt},
-    ClientHandshake, CommonError, DatagramFrame, ServerHandshake, TcpRequest, TcpResponse,
-    AUTH_RESPONSE_PADDING, CLIENT_TCP_REQUEST_ID, HANDSHAKE_HEADER_AUTH, HANDSHAKE_HEADER_CC_RX,
-    HANDSHAKE_HEADER_PADDING, HANDSHAKE_HEADER_UDP, HANDSHAKE_HOST, HANDSHAKE_PATH,
-    HANDSHAKE_STATUS_OK, SERVER_TCP_RESPONSE_STATUS_OK, TCP_RESPONSE_PADDING,
+    datagram::{
+        DatagramPacket, DatagramSender, DatagramSessionManager, DatagramSocket,
+        MAX_DATAGRAM_CHANNEL_CAPACITY,
+    },
+    utils::{AsyncReadStreamExt, BoxFuture, BufExt, BufMutExt},
+    ClientHandshake, CommonError, DatagramFrame, DatagramSessionId, ProxyAddress, ServerHandshake,
+    TcpRequest, TcpResponse, AUTH_RESPONSE_PADDING, CLIENT_TCP_REQUEST_ID, HANDSHAKE_HEADER_AUTH,
+    HANDSHAKE_HEADER_CC_RX, HANDSHAKE_HEADER_PADDING, HANDSHAKE_HEADER_UDP, HANDSHAKE_HOST,
+    HANDSHAKE_PATH, HANDSHAKE_STATUS_OK, SERVER_TCP_RESPONSE_STATUS_OK, TCP_RESPONSE_PADDING,
 };
 
 use super::{Authentication, ConnectionConfig, ConnectionConfigBuilder, Error};
@@ -20,7 +27,7 @@ use super::{Authentication, ConnectionConfig, ConnectionConfigBuilder, Error};
 pub struct Connection {
     conn: quinn::Connection,
     config: ConnectionConfig,
-    cache: DatagramSessionManager,
+    session: DatagramSessionManager,
 }
 
 impl Connection {
@@ -30,16 +37,16 @@ impl Connection {
         Self {
             conn,
             config,
-            cache: DatagramSessionManager::new(idle_timeout),
+            session: DatagramSessionManager::new(idle_timeout),
         }
     }
 }
 
 impl Connection {
-    #[tracing::instrument(level = "info", skip(self))]
-    pub async fn process(&self) -> Result<(), Error> {
+    #[tracing::instrument(level = "info", skip(self), fields(conn.ip = %self.conn.remote_address()))]
+    pub async fn process(self) -> Result<(), Error> {
         let conn = self.conn.clone();
-        tracing::info!("Processing connection: {}", conn.remote_address());
+        tracing::info!("Processing connection");
         let mut h3_conn: h3::server::Connection<h3_quinn::Connection, Bytes> =
             h3::server::Connection::new(h3_quinn::Connection::new(conn))
                 .await
@@ -65,20 +72,34 @@ impl Connection {
                 tracing::debug!("Client authentication succeeded: {:?}", client_handshake);
                 server_handshake(stream, &self.config).await?;
                 tracing::info!(
-                    "Handshake completed, serve the connection as a Hysteria connection. Ip: {}",
-                    self.conn.remote_address()
+                    "Handshake completed, serve the connection as a Hysteria connection."
                 );
                 drop(h3_conn);
                 loop {
                     tokio::select! {
                         stream = self.conn.accept_bi() =>  {
-                            let (mut send_stream, mut recv_stream) = stream.map_err(CommonError::from)?;
-                            process_tcp_request_message(&mut recv_stream, &mut send_stream).await?;
+                            let (send_stream, recv_stream) = stream.map_err(CommonError::from)?;
 
+                            tokio::spawn(async move {
+                                if let Err(e) =  process_tcp_request_message(recv_stream, send_stream).await {
+                                    tracing::warn!("Error processing TCP request: {}", e);
+                                }
+                            });
                         }
                         datagram = self.conn.read_datagram() => {
+                            if !self.config.udp {
+                                tracing::info!("UDP is disabled, drop the datagram");
+                                continue;
+                            }
                             let datagram = datagram.map_err(CommonError::from)?;
-                            process_udp_message(&self.cache, datagram).await?;
+                            let cache = self.session.clone();
+                            let conn = self.conn.clone();
+                            let idle_timeout = self.config.idle_timeout;
+                            tokio::spawn(async move {
+                                if let Err(e) = process_udp_message(cache, conn ,datagram, idle_timeout).await {
+                                    tracing::warn!("Error processing UDP message: {}", e);
+                                }
+                            });
                         }
                     }
                 }
@@ -207,9 +228,19 @@ async fn process_tcp_request_message(
         message: "Miro".into(),
     };
     send_tcp_response_message(&mut send_stream, response).await?;
-    tracing::error!("TCP proxy not implemented yet");
-    // TODO: Implement TCP proxy
-    Ok(())
+    let addr = request.address.resolve().await?;
+    let outbound_stream = TcpStream::connect(addr)
+        .await
+        .map_err(|e| CommonError::IoError(Arc::new(e)))?;
+    let (mut outbound_read, mut outbound_write) = outbound_stream.into_split();
+    let result = tokio::join!(
+        tokio::io::copy(&mut recv_stream, &mut outbound_write),
+        tokio::io::copy(&mut outbound_read, &mut send_stream)
+    );
+    match result {
+        (Ok(_), Ok(_)) => Ok(()),
+        (Err(e), _) | (_, Err(e)) => Err(CommonError::IoError(Arc::new(e)))?,
+    }
 }
 
 async fn read_tcp_request_message(
@@ -217,10 +248,9 @@ async fn read_tcp_request_message(
 ) -> Result<TcpRequest, Error> {
     let status = stream.read_varint().await?;
     if status != CLIENT_TCP_REQUEST_ID.into_inner() {
-        return Err(Error::TcpMessageError(format!(
-            "Invalid request ID: {}",
-            status
-        )));
+        return Err(CommonError::ParseError(
+            format!("Invalid request ID: {}", status).into(),
+        ))?;
     }
     let address = stream.read_proxy_address().await?;
     stream.read_padding().await?;
@@ -237,19 +267,27 @@ async fn send_tcp_response_message(
     let message = response.message.as_bytes();
     buf.put_variable_slice(message)?;
     buf.put_padding(TCP_RESPONSE_PADDING)?;
-    stream.write_all(&buf).await.map_err(CommonError::from)?;
+    stream
+        .write_all(&buf)
+        .await
+        .map_err(|e| CommonError::from(Arc::new(e)))?;
     Ok(())
 }
 
 #[tracing::instrument(level = "debug", skip(cache, message))]
-async fn process_udp_message(cache: &DatagramSessionManager, message: Bytes) -> Result<(), Error> {
+async fn process_udp_message(
+    cache: DatagramSessionManager,
+    conn: quinn::Connection,
+    message: Bytes,
+    idle_timeout: Duration,
+) -> Result<(), Error> {
     let frame = read_datagram_frame(message)?;
     if let Some(_data) = cache
         .insert_and_try_collect(
             frame.session_id,
             frame.packet_id,
             frame.frame_id,
-            frame.payload,
+            frame.payload.clone(),
             frame.frame_count,
         )
         .await
@@ -259,10 +297,39 @@ async fn process_udp_message(cache: &DatagramSessionManager, message: Bytes) -> 
             frame.session_id,
             frame.packet_id
         );
-        tracing::error!("UDP proxy not implemented yet");
-        // TODO: Implement UDP proxy
-        // let socket = cache.get_socket(frame.session_id, frame.address).await?;
-        // socket.send_to(&data, frame.address).await?;
+        let create_sender_and_transport = async {
+            let (sender, receiver) = tokio::sync::mpsc::channel(MAX_DATAGRAM_CHANNEL_CAPACITY);
+            crate_udp_and_transport(
+                conn,
+                receiver,
+                frame.session_id,
+                &frame.address,
+                idle_timeout,
+                cache.get_session_invalidate_fn(),
+            )
+            .await?;
+            Ok(sender)
+        };
+        let sender = cache
+            .get_sender(frame.session_id, create_sender_and_transport)
+            .await
+            .map_err(|e| CommonError::clone(&e))?;
+        if let Err(e) = sender
+            .send(DatagramPacket {
+                session_id: frame.session_id,
+                packet_id: 0, // the packet_id is not used in the UDP outbound.
+                payload: frame.payload,
+                address: frame.address,
+            })
+            .await
+        {
+            tracing::error!(
+                session_id = frame.session_id,
+                "Error transport Hysteria datagram packet in channel: {}, drop the session",
+                e
+            );
+            cache.get_session_invalidate_fn()(frame.session_id).await;
+        }
     }
     Ok(())
 }
@@ -281,6 +348,69 @@ fn read_datagram_frame(mut message: Bytes) -> Result<DatagramFrame, Error> {
         address,
         payload: message,
     })
+}
+
+async fn crate_udp_and_transport(
+    connection: quinn::Connection,
+    mut receiver: Receiver<DatagramPacket>,
+    session_id: DatagramSessionId,
+    addr: &ProxyAddress,
+    idle_timeout: Duration,
+    invalidate_fn: impl FnOnce(DatagramSessionId) -> BoxFuture<()> + Send + 'static,
+) -> Result<(), CommonError> {
+    let addr = addr.resolve().await?;
+    let local_addr = if addr.is_ipv4() {
+        "127.0.0.1:0"
+    } else {
+        "[::1]:0"
+    };
+    let udp = DatagramSocket::bind(local_addr).await?;
+    tokio::spawn(async move {
+        let result = async move {
+            let packet_sender = Arc::new(DatagramSender::new(connection));
+            tracing::info!(session_id = session_id, "Starting UDP packet transport");
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(idle_timeout) => {
+                        return Ok::<(), CommonError>(());
+                    }
+                    Some(packet) = receiver.recv() => {
+                        let udp = udp.clone();
+                        tokio::spawn(async move{
+                            tracing::debug!(session_id = session_id, "Transport the Hysteria packet as a UDP packet: {:?}", packet);
+                            if let Err(e) = udp.send_to_proxy_address(packet.payload, packet.address).await {
+                                tracing::warn!(session_id = packet.session_id, packet_id = packet.packet_id, "Error sending UDP packet: {}", e);
+                            }
+                        });
+                    }
+                    recv_data = udp.recv_from() => {
+                        let (data, addr) = recv_data?;
+                        let packet = DatagramPacket {
+                            session_id,
+                            packet_id: 0, // the packet_id is filled by DatagramSender.
+                            payload: data,
+                            address: ProxyAddress::new(addr.to_string()),
+                        };
+                        let packet_sender = packet_sender.clone();
+                        tokio::spawn(async move {
+                            tracing::debug!(session_id = session_id, "Transport the UDP packet as Hysteria packet(s): {:?}", packet);
+                            if let Err(e) = packet_sender.send(packet).await {
+                                tracing::warn!("Error sending Hysteria datagram packet: {}", e);
+                            }
+                        });
+                    }
+                    else => return Ok(())
+                }
+            }
+        };
+        if let Err(e) = result.await {
+            tracing::warn!(session_id = session_id, "Error sending UDP packet: {}", e);
+        } else {
+            tracing::info!(session_id = session_id, "Finished UDP packet transport");
+        }
+        invalidate_fn(session_id).await;
+    });
+    Ok(())
 }
 
 #[cfg(test)]
@@ -435,19 +565,19 @@ mod tests {
             buf.put_padding(TCP_REQUEST_PADDING).unwrap();
             let mut stream = Cursor::new(buf.freeze());
             let request = read_tcp_request_message(&mut stream).await.unwrap();
-            assert_eq!(request.address, "test.cc:80".parse().unwrap());
+            assert_eq!(request.address, "test.cc:80".into());
         }
 
         #[tokio::test]
         async fn test_read_tcp_request_message_invalid_request_id() {
             let mut buf = bytes::BytesMut::new();
             buf.put_varint(VarInt::from_u64(0).unwrap());
-            buf.put_variable_slice(b"test.cc:80").unwrap();
+            buf.put_variable_slice(b"test.cc:80\xFF").unwrap();
             buf.put_padding(TCP_REQUEST_PADDING).unwrap();
             let mut stream = Cursor::new(buf.freeze());
             let request = read_tcp_request_message(&mut stream).await;
             assert!(
-                matches!(request, Err(Error::TcpMessageError(e)) if e == "Invalid request ID: 0")
+                matches!(request, Err(Error::Other(crate::CommonError::ParseError(e))) if e == "Invalid request ID: 0")
             );
         }
 
@@ -460,7 +590,7 @@ mod tests {
             let mut stream = Cursor::new(buf.freeze());
             let request = read_tcp_request_message(&mut stream).await;
             assert!(
-                matches!(request, Err(Error::TcpMessageError(e)) if e == "Invalid address length")
+                matches!(request, Err(Error::Other(crate::CommonError::ParseError(e))) if e == "Invalid address length")
             );
         }
 
@@ -472,7 +602,7 @@ mod tests {
             buf.put_padding(TCP_REQUEST_PADDING).unwrap();
             let mut stream = Cursor::new(buf.freeze());
             let request = read_tcp_request_message(&mut stream).await;
-            assert!(matches!(request, Err(Error::TcpMessageError(e)) if e == "Invalid address"));
+            assert!(matches!(request, Err(Error::Other(crate::CommonError::ParseError(e))) if e == "Invalid address"));
         }
     }
 

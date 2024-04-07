@@ -1,10 +1,13 @@
-use std::io;
+use std::{io, sync::Arc};
 
 use bytes::{Buf, BufMut};
 use quinn::VarInt;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::{CommonError, Padding, ProxyAddress};
+
+pub(crate) type BoxFuture<T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'static + Send>>;
 
 pub(crate) trait AsyncReadStreamExt: AsyncRead {
     async fn read_varint(&mut self) -> Result<u64, CommonError>;
@@ -21,7 +24,9 @@ where
         let mut shift = 0;
         loop {
             let mut buf = [0u8; 1];
-            self.read_exact(&mut buf).await?;
+            self.read_exact(&mut buf)
+                .await
+                .map_err(|e| CommonError::IoError(Arc::new(e)))?;
             let byte = buf[0];
             result |= ((byte & 0x7F) as u64) << shift;
             if byte & 0x80 == 0 {
@@ -37,18 +42,21 @@ where
             return Err(CommonError::ParseError("Invalid address length".into()));
         }
         let mut buf = vec![0u8; address_len];
-        self.read_exact(&mut buf).await?;
+        self.read_exact(&mut buf)
+            .await
+            .map_err(|e| CommonError::IoError(Arc::new(e)))?;
         let address: ProxyAddress = String::from_utf8(buf)
             .map_err(|_| CommonError::ParseError("Invalid address".into()))?
-            .parse()
-            .map_err(|_| CommonError::ParseError("Invalid address".into()))?;
+            .into();
         Ok(address)
     }
 
     async fn read_padding(&mut self) -> Result<(), CommonError> {
         let padding_len = self.read_varint().await? as usize;
         let mut buf = vec![0u8; padding_len];
-        self.read_exact(&mut buf).await?;
+        self.read_exact(&mut buf)
+            .await
+            .map_err(|e| CommonError::IoError(Arc::new(e)))?;
         Ok(())
     }
 }
@@ -76,7 +84,7 @@ impl<B: BufMut> BufMutExt for B {
         }
     }
     fn put_proxy_address(&mut self, address: &ProxyAddress) -> Result<(), CommonError> {
-        let address = address.to_string();
+        let address = address.as_str();
         self.put_varint(VarInt::from_u64(address.len() as u64).map_err(|_| {
             CommonError::VarIntBoundsExceeded("Address length exceeds bounds".into())
         })?);
@@ -135,8 +143,7 @@ where
         self.read_exact(&mut buf)?;
         let address: ProxyAddress = String::from_utf8(buf)
             .map_err(|_| CommonError::ParseError("Invalid address".into()))?
-            .parse()
-            .map_err(|_| CommonError::ParseError("Invalid address".into()))?;
+            .into();
         Ok(address)
     }
 
@@ -154,10 +161,10 @@ where
 
     fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), CommonError> {
         if self.remaining() < buf.len() {
-            return Err(CommonError::IoError(io::Error::new(
+            return Err(CommonError::IoError(Arc::new(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "Unexpected EOF",
-            )));
+            ))));
         }
         self.copy_to_slice(buf);
         Ok(())

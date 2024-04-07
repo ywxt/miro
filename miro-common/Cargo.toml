@@ -21,4 +21,8 @@ thiserror.workspace = true
 # own dependencies
 rand = "0.8"
 bytes = "1.6"
-moka = {version = "0.12", features = ["future"]}
+moka = { version = "0.12", features = ["future"] }
+
+[dev-dependencies]
+rustls.workspace = true
+tracing-subscriber = { workspace = true, features = ["env-filter"] }

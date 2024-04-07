@@ -1,11 +1,13 @@
 use bytes::Bytes;
 use quinn::VarInt;
 use std::{
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::SocketAddr,
     num::ParseIntError,
     str::FromStr,
+    sync::Arc,
 };
-use thiserror::Error;
+
+use crate::CommonError;
 
 pub const HANDSHAKE_PATH: &str = "/auth";
 pub const HANDSHAKE_HOST: &str = "hysteria";
@@ -84,139 +86,49 @@ pub struct TcpRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProxyAddress {
-    pub host: ProxyHost,
-    pub port: u16,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProxyHost {
-    Domain(String),
-    IpV4(Ipv4Addr),
-    IpV6(Ipv6Addr),
-}
-
-#[derive(Debug, Error)]
-pub enum ParseAddressError {
-    #[error("Invalid port, original address: {0}")]
-    InvalidPort(String),
-    #[error("Invalid host, original address: {0}")]
-    InvalidHost(String),
-    #[error("Invalid address, original address: {0}")]
-    InvalidAddress(String),
-}
+pub struct ProxyAddress(String);
 
 impl ProxyAddress {
-    pub fn new(host: ProxyHost, port: u16) -> Self {
-        ProxyAddress { host, port }
+    pub fn new(s: String) -> Self {
+        ProxyAddress(s)
+    }
+
+    pub async fn resolve(&self) -> Result<SocketAddr, CommonError> {
+        tokio::net::lookup_host(self.0.as_str())
+            .await
+            .map_err(|e| CommonError::from(Arc::new(e)))?
+            .next()
+            .ok_or(CommonError::AddressResolutionError(
+                "No address resolved".into(),
+            ))
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
     }
 }
 
-impl From<Ipv4Addr> for ProxyHost {
-    fn from(ip: Ipv4Addr) -> Self {
-        ProxyHost::IpV4(ip)
+impl From<String> for ProxyAddress {
+    fn from(s: String) -> Self {
+        ProxyAddress(s)
     }
 }
 
-impl From<Ipv6Addr> for ProxyHost {
-    fn from(ip: Ipv6Addr) -> Self {
-        ProxyHost::IpV6(ip)
-    }
-}
-
-impl From<String> for ProxyHost {
-    fn from(domain: String) -> Self {
-        if let Ok(v4) = Ipv4Addr::from_str(&domain) {
-            ProxyHost::IpV4(v4)
-        } else if let Ok(v6) = Ipv6Addr::from_str(&domain) {
-            ProxyHost::IpV6(v6)
-        } else {
-            ProxyHost::Domain(domain)
-        }
-    }
-}
-
-impl From<&str> for ProxyHost {
-    fn from(domain: &str) -> Self {
-        if let Ok(v4) = Ipv4Addr::from_str(domain) {
-            ProxyHost::IpV4(v4)
-        } else if let Ok(v6) = Ipv6Addr::from_str(domain) {
-            ProxyHost::IpV6(v6)
-        } else {
-            ProxyHost::Domain(domain.to_string())
-        }
-    }
-}
-
-impl ToString for ProxyHost {
-    fn to_string(&self) -> String {
-        match self {
-            ProxyHost::Domain(domain) => domain.clone(),
-            ProxyHost::IpV4(ip) => ip.to_string(),
-            ProxyHost::IpV6(ip) => ip.to_string(),
-        }
+impl From<&str> for ProxyAddress {
+    fn from(s: &str) -> Self {
+        ProxyAddress(s.to_string())
     }
 }
 
 impl ToString for ProxyAddress {
     fn to_string(&self) -> String {
-        format!("{}:{}", self.host.to_string(), self.port)
+        self.0.clone()
     }
 }
 
-impl FromStr for ProxyAddress {
-    type Err = ParseAddressError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if let Ok(address) = SocketAddr::from_str(s) {
-            return match address {
-                SocketAddr::V4(v4) => Ok(ProxyAddress::new(ProxyHost::IpV4(*v4.ip()), v4.port())),
-                SocketAddr::V6(v6) => Ok(ProxyAddress::new(ProxyHost::IpV6(*v6.ip()), v6.port())),
-            };
-        }
-        let parts = s
-            .rfind(':')
-            .ok_or_else(|| ParseAddressError::InvalidAddress(s.to_string()))?;
-        if parts == 0 {
-            return Err(ParseAddressError::InvalidAddress(s.to_string()));
-        }
-        if parts == s.len() - 1 {
-            return Err(ParseAddressError::InvalidAddress(s.to_string()));
-        }
-        let host = &s[..parts];
-        let port = &s[parts + 1..];
-        let port = port
-            .parse::<u16>()
-            .map_err(|_| ParseAddressError::InvalidPort(s.to_string()))?;
-        Ok(ProxyAddress::new(ProxyHost::Domain(host.into()), port))
+impl AsRef<str> for ProxyAddress {
+    fn as_ref(&self) -> &str {
+        self.0.as_str()
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_parse_address() {
-        let address = "test.cc:233".parse::<ProxyAddress>().unwrap();
-        assert_eq!(address.host, ProxyHost::Domain("test.cc".to_string()));
-        assert_eq!(address.port, 233);
-    }
-
-    #[test]
-    fn test_parse_address_ipv4() {
-        let address = "192.168.1.1:233".parse::<ProxyAddress>().unwrap();
-        assert_eq!(address.host, ProxyHost::IpV4(Ipv4Addr::new(192, 168, 1, 1)));
-        assert_eq!(address.port, 233);
-    }
-
-    #[test]
-    fn test_parse_address_ipv6() {
-        let address = "[2001:db8::1]:233".parse::<ProxyAddress>().unwrap();
-        assert_eq!(
-            address.host,
-            ProxyHost::IpV6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1))
-        );
-        assert_eq!(address.port, 233);
-    }
-}

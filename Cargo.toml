@@ -1,9 +1,5 @@
 [workspace]
-members = [
-  "miro-common",
-  "miro-client",
-  "miro-server",
-]
+members = ["miro-common", "miro-client", "miro-server"]
 
 resolver = "2"
 
@@ -12,11 +8,9 @@ tokio = { version = "1.37", features = ["full"] }
 quinn = "0.10"
 h3 = "0.0.4"
 h3-quinn = "0.0.5"
+rustls = { version = "0.21" }
 tracing = "0.1"
+tracing-subscriber = {version = "0.3", features = ["env-filter"]}
 axum = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "1.0"
-
-
-
-
