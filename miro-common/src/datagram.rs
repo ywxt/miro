@@ -18,7 +18,6 @@ pub type PacketCachedID = (DatagramSessionId, DatagramPacketId);
 #[derive(Debug)]
 pub struct DatagramPacket {
     pub session_id: DatagramSessionId,
-    pub packet_id: DatagramPacketId,
     pub address: ProxyAddress,
     pub payload: Bytes,
 }
@@ -216,9 +215,8 @@ impl DatagramSender {
     pub fn new(conn: quinn::Connection) -> Self {
         Self { _conn: conn, recorded_packet_id: AtomicU16::new(0) }
     }
-    pub async fn send(&self, mut packet: DatagramPacket) -> Result<(), CommonError> {
-        let packet_id = self.recorded_packet_id.fetch_add(1, Ordering::SeqCst);
-        packet.packet_id = packet_id;
+    pub async fn send(&self, _packet: DatagramPacket) -> Result<(), CommonError> {
+        let _packet_id = self.recorded_packet_id.fetch_add(1, Ordering::SeqCst);
         unimplemented!("QuicDatagramSender::send")
     }
 }

@@ -63,7 +63,7 @@ async fn test_server_handshake() {
     let client = create_client();
     let handler = tokio::spawn(async move {
         if let Ok(Some(conn)) = server.accept_connection().await {
-            let _ = conn.process().await;
+             conn.process().await.unwrap();
         }
     });
     let conn = client
@@ -106,4 +106,42 @@ async fn test_server_handshake() {
     client.wait_idle().await;
     handler.await.unwrap();
     
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_server_invalid_handshake(){
+    let server = create_server();
+    let client = create_client();
+    let handler = tokio::spawn(async move {
+        if let Ok(Some(conn)) = server.accept_connection().await {
+             conn.process().await.unwrap();
+        }
+    });
+    let conn = client
+        .connect(SERVER_ADDRESS.parse().unwrap(), "localhost")
+        .unwrap()
+        .await
+        .unwrap();
+    let quinn_conn = h3_quinn::Connection::new(conn);
+
+    let (mut driver, mut send_request) = h3::client::new(quinn_conn).await.unwrap();
+    let driver = async move { poll_fn(move |cx| driver.poll_close(cx)).await.unwrap() };
+    let request = async move {
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri("https://localhost/auth")
+            .header(HANDSHAKE_HEADER_AUTH, "Hello")
+            .header(HANDSHAKE_HEADER_CC_RX, 0)
+            .header(HANDSHAKE_HEADER_PADDING, "Padding")
+            .body(())
+            .unwrap();
+
+        let mut stream = send_request.send_request(request).await.unwrap();
+        stream.finish().await.unwrap();
+        let response = stream.recv_response().await.unwrap();
+        assert_eq!(response.status(), 404);
+    };
+    tokio::join!(request, driver);
+    client.wait_idle().await;
+    handler.await.unwrap();
 }

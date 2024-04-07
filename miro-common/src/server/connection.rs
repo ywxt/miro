@@ -76,6 +76,9 @@ impl Connection {
                 );
                 drop(h3_conn);
                 loop {
+                    if let Some(result) = check_connection_closed(&self.conn) {
+                        return result.map_err(Error::from);
+                    }
                     tokio::select! {
                         stream = self.conn.accept_bi() =>  {
                             let (send_stream, recv_stream) = stream.map_err(CommonError::from)?;
@@ -87,8 +90,8 @@ impl Connection {
                             });
                         }
                         datagram = self.conn.read_datagram() => {
-                            if !self.config.udp {
-                                tracing::info!("UDP is disabled, drop the datagram");
+                            if !self.config.udp || self.conn.max_datagram_size().is_none(){
+                                tracing::info!("UDP is disabled, drop the packet");
                                 continue;
                             }
                             let datagram = datagram.map_err(CommonError::from)?;
@@ -114,6 +117,25 @@ impl Connection {
             }
         }
     }
+}
+
+fn check_connection_closed(conn: &quinn::Connection) -> Option<Result<(), CommonError>> {
+    conn.close_reason().map(|reason| match reason {
+        quinn::ConnectionError::ConnectionClosed(_)
+        | quinn::ConnectionError::ApplicationClosed(_)
+        | quinn::ConnectionError::LocallyClosed => {
+            tracing::info!("Connection closed");
+            Ok(())
+        }
+        quinn::ConnectionError::Reset => {
+            tracing::info!("Connection reset");
+            Ok(())
+        }
+        other => {
+            tracing::warn!("Connection error: {:?}", other);
+            Err(CommonError::from(other))
+        }
+    })
 }
 
 type ClientHandshakeError = Cow<'static, str>;
@@ -317,7 +339,6 @@ async fn process_udp_message(
         if let Err(e) = sender
             .send(DatagramPacket {
                 session_id: frame.session_id,
-                packet_id: 0, // the packet_id is not used in the UDP outbound.
                 payload: frame.payload,
                 address: frame.address,
             })
@@ -379,7 +400,7 @@ async fn crate_udp_and_transport(
                         tokio::spawn(async move{
                             tracing::debug!(session_id = session_id, "Transport the Hysteria packet as a UDP packet: {:?}", packet);
                             if let Err(e) = udp.send_to_proxy_address(packet.payload, packet.address).await {
-                                tracing::warn!(session_id = packet.session_id, packet_id = packet.packet_id, "Error sending UDP packet: {}", e);
+                                tracing::warn!(session_id = packet.session_id, "Error sending UDP packet: {}", e);
                             }
                         });
                     }
@@ -387,7 +408,6 @@ async fn crate_udp_and_transport(
                         let (data, addr) = recv_data?;
                         let packet = DatagramPacket {
                             session_id,
-                            packet_id: 0, // the packet_id is filled by DatagramSender.
                             payload: data,
                             address: ProxyAddress::new(addr.to_string()),
                         };
@@ -602,7 +622,9 @@ mod tests {
             buf.put_padding(TCP_REQUEST_PADDING).unwrap();
             let mut stream = Cursor::new(buf.freeze());
             let request = read_tcp_request_message(&mut stream).await;
-            assert!(matches!(request, Err(Error::Other(crate::CommonError::ParseError(e))) if e == "Invalid address"));
+            assert!(
+                matches!(request, Err(Error::Other(crate::CommonError::ParseError(e))) if e == "Invalid address")
+            );
         }
     }
 
