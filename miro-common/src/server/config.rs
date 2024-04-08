@@ -13,7 +13,7 @@ pub struct ConnectionConfig {
 }
 
 impl ConnectionConfig {
-    pub async fn authenticate(&self, auth: &str) -> Result<bool, crate::CommonError> {
+    pub async fn authenticate(&self, auth: &str) -> Result<bool, crate::Error> {
         self.auth.authenticate(auth).await
     }
 }

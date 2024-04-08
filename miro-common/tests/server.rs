@@ -64,7 +64,7 @@ async fn test_server_handshake() {
     let local_addr = server.local_addr().unwrap();
     let handler = tokio::spawn(async move {
         if let Ok(Some(conn)) = server.accept_connection().await {
-             conn.process().await.unwrap();
+            conn.process().await.unwrap();
         }
     });
     let conn = client
@@ -106,17 +106,16 @@ async fn test_server_handshake() {
     tokio::join!(request, driver);
     client.wait_idle().await;
     handler.await.unwrap();
-    
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn test_server_invalid_handshake(){
+async fn test_server_invalid_handshake() {
     let server = create_server();
     let client = create_client();
     let local_addr = server.local_addr().unwrap();
     let handler = tokio::spawn(async move {
         if let Ok(Some(conn)) = server.accept_connection().await {
-             conn.process().await.unwrap();
+            conn.process().await.unwrap();
         }
     });
     let conn = client

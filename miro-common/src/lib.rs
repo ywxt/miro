@@ -1,10 +1,11 @@
 mod error;
 mod padding;
 mod protocal;
-mod datagram;
 mod utils;
+
+pub mod datagram;
 pub mod server;
 
-pub use error::Error as CommonError;
+pub use error::Error;
 pub use padding::*;
 pub use protocal::*;

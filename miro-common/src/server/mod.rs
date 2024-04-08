@@ -1,18 +1,16 @@
 mod auth;
 mod config;
 mod connection;
-mod error;
 
 pub use auth::*;
 pub use config::*;
 pub use connection::*;
-pub use error::Error;
 
 use std::{net::SocketAddr, sync::Arc};
 
 use quinn::Endpoint;
 
-use crate::CommonError;
+use crate::Error;
 
 #[derive(Debug)]
 pub struct Server {
@@ -26,7 +24,7 @@ impl Server {
 }
 
 impl Server {
-    pub async fn accept_connection(&self) -> Result<Option<Connection>, CommonError> {
+    pub async fn accept_connection(&self) -> Result<Option<Connection>, Error> {
         let incoming = self.endpoint.accept().await;
         if let Some(conn) = incoming {
             let conn = conn.await?;
@@ -36,9 +34,9 @@ impl Server {
         }
     }
 
-    pub fn local_addr(&self) -> Result<SocketAddr, CommonError> {
+    pub fn local_addr(&self) -> Result<SocketAddr, Error> {
         self.endpoint
             .local_addr()
-            .map_err(|e| CommonError::IoError(Arc::new(e)))
+            .map_err(|e| Error::IoError(Arc::new(e)))
     }
 }

@@ -2,11 +2,11 @@ use std::borrow::Cow;
 
 use axum::async_trait;
 
-use crate::CommonError;
+use crate::Error;
 
 #[async_trait]
 trait Authenticator {
-    async fn authenticate(&self, auth: &str) -> Result<bool, CommonError>;
+    async fn authenticate(&self, auth: &str) -> Result<bool, Error>;
 }
 
 #[derive(Debug, Clone)]
@@ -21,7 +21,7 @@ impl Authentication {
 }
 
 impl Authentication {
-    pub async fn authenticate(&self, auth: &str) -> Result<bool, CommonError> {
+    pub async fn authenticate(&self, auth: &str) -> Result<bool, Error> {
         match self {
             Self::Password(authenticator) => authenticator.authenticate(auth).await,
         }
@@ -43,7 +43,7 @@ impl PasswordAuthenticator {
 
 #[async_trait]
 impl Authenticator for PasswordAuthenticator {
-    async fn authenticate(&self, auth: &str) -> Result<bool, CommonError> {
+    async fn authenticate(&self, auth: &str) -> Result<bool, Error> {
         Ok(self.password == auth)
     }
 }

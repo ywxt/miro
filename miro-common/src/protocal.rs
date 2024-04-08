@@ -1,13 +1,8 @@
 use bytes::Bytes;
 use quinn::VarInt;
-use std::{
-    net::SocketAddr,
-    num::ParseIntError,
-    str::FromStr,
-    sync::Arc,
-};
+use std::{net::SocketAddr, num::ParseIntError, ops::Deref, str::FromStr, sync::Arc};
 
-use crate::CommonError;
+use crate::Error;
 
 pub const HANDSHAKE_PATH: &str = "/auth";
 pub const HANDSHAKE_HOST: &str = "hysteria";
@@ -93,14 +88,12 @@ impl ProxyAddress {
         ProxyAddress(s)
     }
 
-    pub async fn resolve(&self) -> Result<SocketAddr, CommonError> {
+    pub async fn resolve(&self) -> Result<SocketAddr, Error> {
         tokio::net::lookup_host(self.0.as_str())
             .await
-            .map_err(|e| CommonError::from(Arc::new(e)))?
+            .map_err(|e| Error::from(Arc::new(e)))?
             .next()
-            .ok_or(CommonError::AddressResolutionError(
-                "No address resolved".into(),
-            ))
+            .ok_or(Error::AddressResolutionError(self.0.clone().into()))
     }
 
     pub fn as_str(&self) -> &str {
@@ -132,3 +125,10 @@ impl AsRef<str> for ProxyAddress {
     }
 }
 
+impl Deref for ProxyAddress {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_str()
+    }
+}

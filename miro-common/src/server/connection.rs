@@ -15,8 +15,8 @@ use crate::{
         MAX_DATAGRAM_CHANNEL_CAPACITY,
     },
     utils::{AsyncReadStreamExt, BoxFuture, BufExt, BufMutExt},
-    ClientHandshake, CommonError, DatagramFrame, DatagramSessionId, ProxyAddress, ServerHandshake,
-    TcpRequest, TcpResponse, AUTH_RESPONSE_PADDING, CLIENT_TCP_REQUEST_ID, HANDSHAKE_HEADER_AUTH,
+    ClientHandshake, DatagramFrame, DatagramSessionId, ProxyAddress, ServerHandshake, TcpRequest,
+    TcpResponse, AUTH_RESPONSE_PADDING, CLIENT_TCP_REQUEST_ID, HANDSHAKE_HEADER_AUTH,
     HANDSHAKE_HEADER_CC_RX, HANDSHAKE_HEADER_PADDING, HANDSHAKE_HEADER_UDP, HANDSHAKE_HOST,
     HANDSHAKE_PATH, HANDSHAKE_STATUS_OK, SERVER_TCP_RESPONSE_STATUS_OK, TCP_RESPONSE_PADDING,
 };
@@ -48,9 +48,7 @@ impl Connection {
         let conn = self.conn.clone();
         tracing::info!("Processing connection");
         let mut h3_conn: h3::server::Connection<h3_quinn::Connection, Bytes> =
-            h3::server::Connection::new(h3_quinn::Connection::new(conn))
-                .await
-                .map_err(CommonError::from)?;
+            h3::server::Connection::new(h3_quinn::Connection::new(conn)).await?;
         match h3_conn.accept().await {
             Ok(Some((request, stream))) => {
                 tracing::info!("Stream ID: {:?}", stream.id());
@@ -77,11 +75,11 @@ impl Connection {
                 drop(h3_conn);
                 loop {
                     if let Some(result) = check_connection_closed(&self.conn) {
-                        return result.map_err(Error::from);
+                        return result;
                     }
                     tokio::select! {
                         stream = self.conn.accept_bi() =>  {
-                            let (send_stream, recv_stream) = stream.map_err(CommonError::from)?;
+                            let (send_stream, recv_stream) = stream?;
 
                             tokio::spawn(async move {
                                 if let Err(e) =  process_tcp_request_message(recv_stream, send_stream).await {
@@ -94,7 +92,7 @@ impl Connection {
                                 tracing::info!("UDP is disabled, drop the packet");
                                 continue;
                             }
-                            let datagram = datagram.map_err(CommonError::from)?;
+                            let datagram = datagram?;
                             let cache = self.session.clone();
                             let conn = self.conn.clone();
                             let idle_timeout = self.config.idle_timeout;
@@ -113,13 +111,13 @@ impl Connection {
             }
             Err(e) => {
                 tracing::warn!("Error accepting request: {}", e);
-                Err(CommonError::from(e))?
+                Err(Error::from(e))?
             }
         }
     }
 }
 
-fn check_connection_closed(conn: &quinn::Connection) -> Option<Result<(), CommonError>> {
+fn check_connection_closed(conn: &quinn::Connection) -> Option<Result<(), Error>> {
     conn.close_reason().map(|reason| match reason {
         quinn::ConnectionError::ConnectionClosed(_)
         | quinn::ConnectionError::ApplicationClosed(_)
@@ -133,7 +131,7 @@ fn check_connection_closed(conn: &quinn::Connection) -> Option<Result<(), Common
         }
         other => {
             tracing::warn!("Connection error: {:?}", other);
-            Err(CommonError::from(other))
+            Err(Error::from(other))
         }
     })
 }
@@ -197,7 +195,7 @@ async fn serve_masquerading_http<S: h3::quic::SendStream<B>, B: bytes::Buf>(
     mut connection: h3::server::Connection<h3_quinn::Connection, B>,
 ) -> Result<(), Error> {
     send_404(stream).await?;
-    while let Some((request, stream)) = connection.accept().await.map_err(CommonError::from)? {
+    while let Some((request, stream)) = connection.accept().await? {
         tracing::debug!("Received request: {:?}", request);
         send_404(stream).await?;
     }
@@ -212,11 +210,8 @@ async fn send_404<S: h3::quic::SendStream<B>, B: bytes::Buf>(
         .version(Version::HTTP_3)
         .body(())
         .expect("Failed to build the masquerading 404 response.");
-    stream
-        .send_response(response)
-        .await
-        .map_err(CommonError::from)?;
-    stream.finish().await.map_err(CommonError::from)?;
+    stream.send_response(response).await?;
+    stream.finish().await?;
     Ok(())
 }
 
@@ -230,11 +225,8 @@ async fn server_handshake<S: h3::quic::SendStream<B>, B: bytes::Buf>(
         cc_rx: config.cc_rx.clone(),
     };
     let response = build_server_handshake(response);
-    stream
-        .send_response(response)
-        .await
-        .map_err(CommonError::from)?;
-    stream.finish().await.map_err(CommonError::from)?;
+    stream.send_response(response).await?;
+    stream.finish().await?;
     Ok(())
 }
 
@@ -253,7 +245,7 @@ async fn process_tcp_request_message(
     let addr = request.address.resolve().await?;
     let outbound_stream = TcpStream::connect(addr)
         .await
-        .map_err(|e| CommonError::IoError(Arc::new(e)))?;
+        .map_err(|e| Error::IoError(Arc::new(e)))?;
     let (mut outbound_read, mut outbound_write) = outbound_stream.into_split();
     let result = tokio::join!(
         tokio::io::copy(&mut recv_stream, &mut outbound_write),
@@ -261,7 +253,7 @@ async fn process_tcp_request_message(
     );
     match result {
         (Ok(_), Ok(_)) => Ok(()),
-        (Err(e), _) | (_, Err(e)) => Err(CommonError::IoError(Arc::new(e)))?,
+        (Err(e), _) | (_, Err(e)) => Err(Error::IoError(Arc::new(e))),
     }
 }
 
@@ -270,7 +262,7 @@ async fn read_tcp_request_message(
 ) -> Result<TcpRequest, Error> {
     let status = stream.read_varint().await?;
     if status != CLIENT_TCP_REQUEST_ID.into_inner() {
-        return Err(CommonError::ParseError(
+        return Err(Error::ParseError(
             format!("Invalid request ID: {}", status).into(),
         ))?;
     }
@@ -292,8 +284,7 @@ async fn send_tcp_response_message(
     stream
         .write_all(&buf)
         .await
-        .map_err(|e| CommonError::from(Arc::new(e)))?;
-    Ok(())
+        .map_err(|e| Error::from(Arc::new(e)))
 }
 
 #[tracing::instrument(level = "debug", skip(cache, message))]
@@ -335,7 +326,7 @@ async fn process_udp_message(
         let sender = cache
             .get_sender(frame.session_id, create_sender_and_transport)
             .await
-            .map_err(|e| CommonError::clone(&e))?;
+            .map_err(|e| Error::clone(&e))?;
         if let Err(e) = sender
             .send(DatagramPacket {
                 session_id: frame.session_id,
@@ -378,7 +369,7 @@ async fn crate_udp_and_transport(
     addr: &ProxyAddress,
     idle_timeout: Duration,
     invalidate_fn: impl FnOnce(DatagramSessionId) -> BoxFuture<()> + Send + 'static,
-) -> Result<(), CommonError> {
+) -> Result<(), Error> {
     let addr = addr.resolve().await?;
     let local_addr = if addr.is_ipv4() {
         "127.0.0.1:0"
@@ -393,7 +384,7 @@ async fn crate_udp_and_transport(
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(idle_timeout) => {
-                        return Ok::<(), CommonError>(());
+                        return Ok::<(), Error>(());
                     }
                     Some(packet) = receiver.recv() => {
                         let udp = udp.clone();
@@ -414,7 +405,7 @@ async fn crate_udp_and_transport(
                         let packet_sender = packet_sender.clone();
                         tokio::spawn(async move {
                             tracing::debug!(session_id = session_id, "Transport the UDP packet as Hysteria packet(s): {:?}", packet);
-                            if let Err(e) = packet_sender.send(packet).await {
+                            if let Err(e) = packet_sender.send(packet) {
                                 tracing::warn!("Error sending Hysteria datagram packet: {}", e);
                             }
                         });
@@ -572,9 +563,8 @@ mod tests {
         use quinn::VarInt;
 
         use crate::{
-            server::{connection::read_tcp_request_message, Error},
-            utils::BufMutExt,
-            CLIENT_TCP_REQUEST_ID, TCP_REQUEST_PADDING,
+            server::connection::read_tcp_request_message, utils::BufMutExt, CLIENT_TCP_REQUEST_ID,
+            TCP_REQUEST_PADDING,
         };
 
         #[tokio::test]
@@ -597,7 +587,7 @@ mod tests {
             let mut stream = Cursor::new(buf.freeze());
             let request = read_tcp_request_message(&mut stream).await;
             assert!(
-                matches!(request, Err(Error::Other(crate::CommonError::ParseError(e))) if e == "Invalid request ID: 0")
+                matches!(request, Err(crate::Error::ParseError(e)) if e == "Invalid request ID: 0")
             );
         }
 
@@ -610,7 +600,7 @@ mod tests {
             let mut stream = Cursor::new(buf.freeze());
             let request = read_tcp_request_message(&mut stream).await;
             assert!(
-                matches!(request, Err(Error::Other(crate::CommonError::ParseError(e))) if e == "Invalid address length")
+                matches!(request, Err(crate::Error::ParseError(e)) if e == "Invalid address length")
             );
         }
 
@@ -622,9 +612,7 @@ mod tests {
             buf.put_padding(TCP_REQUEST_PADDING).unwrap();
             let mut stream = Cursor::new(buf.freeze());
             let request = read_tcp_request_message(&mut stream).await;
-            assert!(
-                matches!(request, Err(Error::Other(crate::CommonError::ParseError(e))) if e == "Invalid address")
-            );
+            assert!(matches!(request, Err(crate::Error::ParseError(e)) if e == "Invalid address"));
         }
     }
 
