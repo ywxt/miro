@@ -39,25 +39,23 @@ impl DatagramPacket {
     ///
     /// The result contains the packet id and fragment description.
     pub fn sent_size(&self) -> usize {
+        self.header_size() + self.payload.len()
+    }
+
+    /// This method is used to calculate the header size of the packet
+    ///
+    /// The result contains the packet id and fragment description.
+    pub fn header_size(&self) -> usize {
         // Session ID + Packet ID + Fragment ID + Fragment Count
         let mut len = 4 + 2 + 1 + 1;
         len += utils::varint_size(self.address.len() as u64);
         len += self.address.len();
-        len += self.payload.len();
         len
-    }
-
-    /// This method is used to calculate the max header size of the packet
-    ///
-    /// The result contains the packet id and fragment description.
-    pub fn max_header_size(&self) -> usize {
-        // Session ID + Packet ID + Fragment ID + Fragment Count + Address Length + Address
-        4 + 2 + 1 + 1 + 4 + self.address.len()
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct DatagramFrame<'a> {
+struct DatagramFrame<'a> {
     pub session_id: DatagramSessionId,
     pub packet_id: DatagramPacketId,
     pub frame_id: u8,
@@ -303,11 +301,14 @@ impl DatagramSender {
                 max_size: packet.payload.len(),
             })
         } else {
-            if max_size < packet.max_header_size() {
+            if max_size <= packet.header_size() {
                 return Err(Error::DatagramError(quinn::SendDatagramError::TooLarge));
             }
-            let max_size = 1.max(max_size - packet.max_header_size());
+            let max_size = max_size - packet.header_size();
             let frame_count = (packet.payload.len() + max_size - 1) / max_size;
+            if frame_count > u8::MAX as usize {
+                return Err(Error::DatagramError(quinn::SendDatagramError::TooLarge));
+            }
             Ok(DatagramFrameIter {
                 session_id: packet.session_id,
                 packet_id,
@@ -348,7 +349,7 @@ impl<'a> Iterator for DatagramFrameIter<'a> {
     type Item = DatagramFrame<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.payload.is_empty() {
+        if self.frame_id >= self.frame_count {
             return None;
         }
         let frame = DatagramFrame {
@@ -358,7 +359,7 @@ impl<'a> Iterator for DatagramFrameIter<'a> {
             frame_count: self.frame_count,
             address: self.address,
             payload: if self.max_size > self.payload.remaining() {
-                self.payload.clone()
+                self.payload.split_off(0)
             } else {
                 self.payload.split_to(self.max_size)
             },
@@ -419,13 +420,13 @@ mod tests {
         assert_eq!(frame.frame_id, 0);
         assert_eq!(frame.frame_count, 2);
         assert_eq!(frame.address, &address);
-        assert_eq!(&frame.payload[..], b"1234");
+        assert_eq!(&frame.payload[..], b"1234567");
         let frame = &frames[1];
         assert_eq!(frame.session_id, session_id);
         assert_eq!(frame.packet_id, packet_id);
         assert_eq!(frame.frame_id, 1);
         assert_eq!(frame.frame_count, 2);
         assert_eq!(frame.address, &address);
-        assert_eq!(&frame.payload[..], b"5678");
+        assert_eq!(&frame.payload[..], b"8");
     }
 }
