@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use quinn::VarInt;
+use crate::VarInt;
 use std::{net::SocketAddr, num::ParseIntError, ops::Deref, str::FromStr, sync::Arc};
 
 use crate::Error;

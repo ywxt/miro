@@ -2,19 +2,24 @@ use std::{borrow::Cow, sync::Arc};
 
 use thiserror::Error;
 
+use crate::datagram::QuicDatagramError;
+
 #[derive(Debug, Error, Clone)]
 pub enum Error {
-    #[error("Quinn connection error: {0}")]
-    QuinnConnectionError(#[from] quinn::ConnectionError),
+    #[error("Quic connection error: {0}")]
+    QuicConnectionError(#[from] s2n_quic::connection::Error),
 
     #[error("H3 connection error: {0}")]
-    H3Error(#[from] h3::Error),
+    H3Error(#[from] s2n_quic_h3::h3::Error),
+
+    #[error("S2n Quic query error: {0}")]
+    S2nQuicQueryError(#[from] s2n_quic::provider::event::query::Error),
 
     #[error("IO error: {0}")]
     IoError(#[from] Arc<std::io::Error>),
 
-    #[error("Quinn datagram error: {0}")]
-    DatagramError(#[from] quinn::SendDatagramError),
+    #[error("Datagram error: {0}")]
+    QuicDatagramError(#[from] QuicDatagramError),
 
     #[error("Stream/Packet parsing error: {0}")]
     ParseError(Cow<'static, str>),
@@ -30,4 +35,10 @@ pub enum Error {
 
     #[error("Hysteria authentication failed")]
     HysteriaAuthError,
+}
+
+impl From<std::io::Error> for Error {
+    fn from(e: std::io::Error) -> Self {
+        Self::IoError(Arc::new(e))
+    }
 }

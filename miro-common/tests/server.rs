@@ -1,66 +1,63 @@
-use std::{future::poll_fn, sync::Arc};
+use std::{future::poll_fn, path::Path};
 
-use axum::http::{Method, Request};
+use http::{Method, Request};
 use miro_common::{
     server::Server, AUTH_REQUEST_PADDING, HANDSHAKE_HEADER_AUTH, HANDSHAKE_HEADER_CC_RX,
     HANDSHAKE_HEADER_PADDING, HANDSHAKE_HEADER_UDP, HANDSHAKE_STATUS_OK,
 };
-use quinn::Endpoint;
-use rustls::{Certificate, PrivateKey, RootCertStore};
+use s2n_quic::{
+    client::Connect,
+    provider::{datagram::default::Endpoint, tls},
+    Client,
+};
+use s2n_quic_h3::h3;
 
-static ALPN: &[u8] = b"h3";
 const LOCAL_ADDRESS: &str = "127.0.0.1:0";
 fn create_server() -> Server {
     let cert = "tests/server.cert";
     let key = "tests/server.key";
-    let cert = Certificate(std::fs::read(cert).unwrap());
-    let key = PrivateKey(std::fs::read(key).unwrap());
-
-    let mut tls_config = rustls::ServerConfig::builder()
-        .with_safe_default_cipher_suites()
-        .with_safe_default_kx_groups()
-        .with_protocol_versions(&[&rustls::version::TLS13])
+    let tls_config = tls::default::Server::builder()
+        .with_certificate(Path::new(cert), Path::new(key))
         .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert], key)
+        .build()
         .unwrap();
-    tls_config.max_early_data_size = u32::MAX;
-    tls_config.alpn_protocols = vec![ALPN.into()];
-
-    let server_config = quinn::ServerConfig::with_crypto(Arc::new(tls_config));
-    let endpoint = quinn::Endpoint::server(server_config, LOCAL_ADDRESS.parse().unwrap()).unwrap();
-    Server::new(endpoint)
+    let datagram_provider = Endpoint::builder()
+        .with_recv_capacity(200)
+        .unwrap()
+        .build()
+        .unwrap();
+    let server = s2n_quic::Server::builder()
+        .with_tls(tls_config)
+        .unwrap()
+        .with_io(LOCAL_ADDRESS)
+        .unwrap()
+        .with_datagram(datagram_provider)
+        .unwrap()
+        .start()
+        .unwrap();
+    Server::new(server)
 }
 
-fn create_client() -> Endpoint {
-    let mut roots = RootCertStore::empty();
-    roots
-        .add(&Certificate(std::fs::read("tests/ca.cert").unwrap()))
-        .unwrap();
-    let mut tls_config = rustls::ClientConfig::builder()
-        .with_safe_default_cipher_suites()
-        .with_safe_default_kx_groups()
-        .with_protocol_versions(&[&rustls::version::TLS13])
+fn create_client() -> Client {
+    let tls_config = tls::default::Client::builder()
+        .with_certificate(Path::new("tests/ca.cert"))
         .unwrap()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+        .build()
+        .unwrap();
 
-    tls_config.enable_early_data = true;
-    tls_config.alpn_protocols = vec![ALPN.into()];
-
-    let mut client_endpoint =
-        h3_quinn::quinn::Endpoint::client(LOCAL_ADDRESS.parse().unwrap()).unwrap();
-
-    let client_config = quinn::ClientConfig::new(Arc::new(tls_config));
-    client_endpoint.set_default_client_config(client_config);
-
-    client_endpoint
+    Client::builder()
+        .with_tls(tls_config)
+        .unwrap()
+        .with_io(LOCAL_ADDRESS)
+        .unwrap()
+        .start()
+        .unwrap()
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_server_handshake() {
-    let server = create_server();
-    let client = create_client();
+    let mut server = create_server();
+    let mut client = create_client();
     let local_addr = server.local_addr().unwrap();
     let handler = tokio::spawn(async move {
         if let Ok(Some(conn)) = server.accept_connection().await {
@@ -68,13 +65,12 @@ async fn test_server_handshake() {
         }
     });
     let conn = client
-        .connect(local_addr, "localhost")
-        .unwrap()
+        .connect(Connect::new(local_addr).with_server_name("localhost"))
         .await
         .unwrap();
-    let quinn_conn = h3_quinn::Connection::new(conn);
+    let conn = s2n_quic_h3::Connection::new(conn);
 
-    let (mut driver, mut send_request) = h3::client::new(quinn_conn).await.unwrap();
+    let (mut driver, mut send_request) = h3::client::new(conn).await.unwrap();
     let driver = async move { poll_fn(move |cx| driver.poll_close(cx)).await.unwrap() };
     let request = async move {
         let request = Request::builder()
@@ -104,14 +100,15 @@ async fn test_server_handshake() {
         );
     };
     tokio::join!(request, driver);
-    client.wait_idle().await;
+    client.wait_idle().await.unwrap();
     handler.await.unwrap();
+     
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_server_invalid_handshake() {
-    let server = create_server();
-    let client = create_client();
+    let mut server = create_server();
+    let mut client = create_client();
     let local_addr = server.local_addr().unwrap();
     let handler = tokio::spawn(async move {
         if let Ok(Some(conn)) = server.accept_connection().await {
@@ -119,11 +116,10 @@ async fn test_server_invalid_handshake() {
         }
     });
     let conn = client
-        .connect(local_addr, "localhost")
-        .unwrap()
+        .connect(Connect::new(local_addr).with_server_name("localhost"))
         .await
         .unwrap();
-    let quinn_conn = h3_quinn::Connection::new(conn);
+    let quinn_conn = s2n_quic_h3::Connection::new(conn);
 
     let (mut driver, mut send_request) = h3::client::new(quinn_conn).await.unwrap();
     let driver = async move { poll_fn(move |cx| driver.poll_close(cx)).await.unwrap() };
@@ -143,6 +139,6 @@ async fn test_server_invalid_handshake() {
         assert_eq!(response.status(), 404);
     };
     tokio::join!(request, driver);
-    client.wait_idle().await;
+    client.wait_idle().await.unwrap();
     handler.await.unwrap();
 }

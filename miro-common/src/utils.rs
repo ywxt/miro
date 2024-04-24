@@ -1,7 +1,7 @@
 use std::{io, sync::Arc};
 
+use crate::VarInt;
 use bytes::{Buf, BufMut};
-use quinn::VarInt;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::{Error, Padding, ProxyAddress};
@@ -69,7 +69,7 @@ pub trait BufMutExt: BufMut {
 
 impl<B: BufMut> BufMutExt for B {
     fn put_varint(&mut self, value: VarInt) {
-        let mut value = value.into_inner();
+        let mut value = value.as_u64();
         loop {
             let mut byte = (value & 0x7F) as u8;
             value >>= 7;
@@ -85,7 +85,7 @@ impl<B: BufMut> BufMutExt for B {
     fn put_proxy_address(&mut self, address: &ProxyAddress) -> Result<(), Error> {
         let address = address.as_str();
         self.put_varint(
-            VarInt::from_u64(address.len() as u64)
+            VarInt::try_from(address.len())
                 .map_err(|_| Error::VarIntBoundsExceeded("Address length exceeds bounds".into()))?,
         );
         self.put_slice(address.as_bytes());
@@ -94,7 +94,7 @@ impl<B: BufMut> BufMutExt for B {
 
     fn put_variable_slice(&mut self, slice: &[u8]) -> Result<(), Error> {
         self.put_varint(
-            VarInt::from_u64(slice.len() as u64).map_err(|_| {
+            VarInt::try_from(slice.len() as u64).map_err(|_| {
                 Error::VarIntBoundsExceeded("The slice length exceeds bounds".into())
             })?,
         );
@@ -185,7 +185,7 @@ where
     }
 }
 
-pub fn varint_size(value: u64) -> usize {
+pub fn varint_size(value: u64) -> u64 {
     if value < 2u64.pow(6) {
         1
     } else if value < 2u64.pow(14) {
@@ -196,5 +196,18 @@ pub fn varint_size(value: u64) -> usize {
         8
     } else {
         unreachable!("malformed VarInt");
+    }
+}
+
+/// Ignore the error if the connection is closed
+pub fn transform_connection_error(
+    err: s2n_quic_core::connection::Error,
+) -> Option<s2n_quic_core::connection::Error> {
+    match err {
+        s2n_quic::connection::Error::Closed { .. } => None,
+        s2n_quic::connection::Error::Transport { .. } => None,
+        s2n_quic::connection::Error::Application { .. } => None,
+        s2n_quic::connection::Error::ImmediateClose { .. } => None,
+        _ => Some(err),
     }
 }

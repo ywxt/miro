@@ -1,12 +1,16 @@
 use std::{borrow::Cow, sync::Arc, time::Duration};
 
-use axum::http::{Method, Request, Response, Version};
 use bytes::{BufMut, Bytes};
+use http::{Method, Request, Response, Version};
+use s2n_quic::{
+    connection::{BidirectionalStreamAcceptor, Handle},
+    provider::datagram::default::Receiver,
+};
+use s2n_quic_h3::h3;
 
 use tokio::{
     io::{AsyncRead, AsyncWrite, AsyncWriteExt},
     net::TcpStream,
-    sync::mpsc::Receiver,
 };
 
 use crate::{
@@ -14,7 +18,7 @@ use crate::{
         DatagramPacket, DatagramSender, DatagramSessionManager, DatagramSocket,
         MAX_DATAGRAM_CHANNEL_CAPACITY,
     },
-    utils::{AsyncReadStreamExt, BoxFuture, BufExt, BufMutExt},
+    utils::{transform_connection_error, AsyncReadStreamExt, BoxFuture, BufExt, BufMutExt},
     ClientHandshake, DatagramFrame, DatagramSessionId, ProxyAddress, ServerHandshake, TcpRequest,
     TcpResponse, AUTH_RESPONSE_PADDING, CLIENT_TCP_REQUEST_ID, HANDSHAKE_HEADER_AUTH,
     HANDSHAKE_HEADER_CC_RX, HANDSHAKE_HEADER_PADDING, HANDSHAKE_HEADER_UDP, HANDSHAKE_HOST,
@@ -25,13 +29,13 @@ use super::{Authentication, ConnectionConfig, ConnectionConfigBuilder, Error};
 
 #[derive(Debug)]
 pub struct Connection {
-    conn: quinn::Connection,
+    conn: s2n_quic::Connection,
     config: ConnectionConfig,
     session: DatagramSessionManager,
 }
 
 impl Connection {
-    pub fn new(conn: quinn::Connection) -> Self {
+    pub fn new(conn: s2n_quic::Connection) -> Self {
         let config = ConnectionConfigBuilder::new(Authentication::new_password("Hello")).build();
         let idle_timeout = config.idle_timeout;
         Self {
@@ -43,12 +47,12 @@ impl Connection {
 }
 
 impl Connection {
-    #[tracing::instrument(level = "info", skip(self), fields(conn.ip = %self.conn.remote_address()))]
+    #[tracing::instrument(level = "info", skip(self), fields(conn.ip = ?self.conn.remote_addr()))]
     pub async fn process(self) -> Result<(), Error> {
-        let conn = self.conn.clone();
+        let conn = self.conn;
         tracing::info!("Processing connection");
-        let mut h3_conn: h3::server::Connection<h3_quinn::Connection, Bytes> =
-            h3::server::Connection::new(h3_quinn::Connection::new(conn)).await?;
+        let mut h3_conn: h3::server::Connection<s2n_quic_h3::Connection, Bytes> =
+            h3::server::Connection::new(s2n_quic_h3::Connection::new(conn)).await?;
         match h3_conn.accept().await {
             Ok(Some((request, stream))) => {
                 tracing::info!("Stream ID: {:?}", stream.id());
@@ -72,68 +76,86 @@ impl Connection {
                 tracing::info!(
                     "Handshake completed, serve the connection as a Hysteria connection."
                 );
-                drop(h3_conn);
+                let conn = &mut h3_conn.inner.conn.conn;
+                let bidi_acceptor = &mut h3_conn.inner.conn.bidi_acceptor;
                 loop {
-                    if let Some(result) = check_connection_closed(&self.conn) {
-                        return result;
-                    }
-                    tokio::select! {
-                        stream = self.conn.accept_bi() =>  {
-                            let (send_stream, recv_stream) = stream?;
-
-                            tokio::spawn(async move {
-                                if let Err(e) =  process_tcp_request_message(recv_stream, send_stream).await {
-                                    tracing::warn!("Error processing TCP request: {}", e);
-                                }
-                            });
-                        }
-                        datagram = self.conn.read_datagram() => {
-                            if !self.config.udp || self.conn.max_datagram_size().is_none(){
-                                tracing::info!("UDP is disabled, drop the packet");
-                                continue;
-                            }
-                            let datagram = datagram?;
-                            let cache = self.session.clone();
-                            let conn = self.conn.clone();
-                            let idle_timeout = self.config.idle_timeout;
-                            tokio::spawn(async move {
-                                if let Err(e) = process_udp_message(cache, conn ,datagram, idle_timeout).await {
-                                    tracing::warn!("Error processing UDP message: {}", e);
-                                }
-                            });
+                    // Datagram
+                    Self::receive_datagram(conn.clone(), &self.session, &self.config)?;
+                    // Stream
+                    if let Err(err) = Self::receive_stream(bidi_acceptor).await {
+                        // Ignore connection closed error and stop the loop
+                        if let Some(err) = transform_connection_error(err) {
+                            return Err(err)?;
+                        } else {
+                            break;
                         }
                     }
                 }
             }
             Ok(None) => {
                 tracing::info!("No request received");
-                Ok(())
             }
             Err(e) => {
                 tracing::warn!("Error accepting request: {}", e);
-                Err(Error::from(e))?
+                return Err(Error::from(e))?;
             }
         }
+        Ok(())
     }
-}
 
-fn check_connection_closed(conn: &quinn::Connection) -> Option<Result<(), Error>> {
-    conn.close_reason().map(|reason| match reason {
-        quinn::ConnectionError::ConnectionClosed(_)
-        | quinn::ConnectionError::ApplicationClosed(_)
-        | quinn::ConnectionError::LocallyClosed => {
-            tracing::info!("Connection closed");
-            Ok(())
+    fn receive_datagram(
+        conn: Handle,
+        session_cache: &DatagramSessionManager,
+        config: &ConnectionConfig,
+    ) -> Result<(), Error> {
+        let datagram = conn.datagram_mut(|receiver: &mut Receiver| receiver.recv_datagram());
+        let datagram = match datagram {
+            Ok(Some(datagram)) => datagram,
+            Ok(None) => {
+                return Ok(());
+            }
+            Err(e) => {
+                tracing::warn!("Error accepting datagram: {}", e);
+                return Err(Error::from(e))?;
+            }
+        };
+        if !config.udp {
+            tracing::info!("UDP is disabled, drop the packet");
+            return Ok(());
         }
-        quinn::ConnectionError::Reset => {
-            tracing::info!("Connection reset");
-            Ok(())
+        let conn = conn.clone();
+        let idle_timeout = config.idle_timeout;
+        let session_cache = session_cache.clone();
+        tokio::spawn(async move {
+            if let Err(e) = process_udp_message(session_cache, conn, datagram, idle_timeout).await {
+                tracing::warn!("Error processing UDP message: {}", e);
+            }
+        });
+        Ok(())
+    }
+
+    async fn receive_stream(
+        acceptor: &mut BidirectionalStreamAcceptor,
+    ) -> Result<(), s2n_quic::connection::Error> {
+        match acceptor.accept_bidirectional_stream().await {
+            Ok(Some(stream)) => {
+                let (recv, send) = stream.split();
+                tokio::spawn(async move {
+                    if let Err(e) = process_tcp_request_message(recv, send).await {
+                        tracing::warn!("Error processing TCP request: {}", e);
+                    }
+                });
+            }
+            Ok(None) => {
+                tracing::info!("Connection closed");
+            }
+            Err(e) => {
+                tracing::warn!("Error accepting stream: {}", e);
+                return Err(e);
+            }
         }
-        other => {
-            tracing::warn!("Connection error: {:?}", other);
-            Err(Error::from(other))
-        }
-    })
+        Ok(())
+    }
 }
 
 type ClientHandshakeError = Cow<'static, str>;
@@ -192,7 +214,7 @@ fn build_server_handshake(response: ServerHandshake) -> Response<()> {
 async fn serve_masquerading_http<S: h3::quic::SendStream<B>, B: bytes::Buf>(
     _request: Request<()>,
     stream: h3::server::RequestStream<S, B>,
-    mut connection: h3::server::Connection<h3_quinn::Connection, B>,
+    mut connection: h3::server::Connection<s2n_quic_h3::Connection, B>,
 ) -> Result<(), Error> {
     send_404(stream).await?;
     while let Some((request, stream)) = connection.accept().await? {
@@ -261,7 +283,7 @@ async fn read_tcp_request_message(
     stream: &mut (impl AsyncRead + Unpin),
 ) -> Result<TcpRequest, Error> {
     let status = stream.read_varint().await?;
-    if status != CLIENT_TCP_REQUEST_ID.into_inner() {
+    if status != CLIENT_TCP_REQUEST_ID.as_u64() {
         return Err(Error::ParseError(
             format!("Invalid request ID: {}", status).into(),
         ))?;
@@ -290,7 +312,7 @@ async fn send_tcp_response_message(
 #[tracing::instrument(level = "debug", skip(cache, message))]
 async fn process_udp_message(
     cache: DatagramSessionManager,
-    conn: quinn::Connection,
+    conn: s2n_quic::connection::Handle,
     message: Bytes,
     idle_timeout: Duration,
 ) -> Result<(), Error> {
@@ -363,8 +385,8 @@ fn read_datagram_frame(mut message: Bytes) -> Result<DatagramFrame, Error> {
 }
 
 async fn crate_udp_and_transport(
-    connection: quinn::Connection,
-    mut receiver: Receiver<DatagramPacket>,
+    connection: s2n_quic::connection::Handle,
+    mut receiver: tokio::sync::mpsc::Receiver<DatagramPacket>,
     session_id: DatagramSessionId,
     addr: &ProxyAddress,
     idle_timeout: Duration,
@@ -433,8 +455,8 @@ mod tests {
             server::connection::client_handshake, HANDSHAKE_HEADER_AUTH, HANDSHAKE_HEADER_CC_RX,
             HANDSHAKE_HEADER_PADDING,
         };
-        use axum::http::Method;
-        use axum::http::Request;
+        use http::Method;
+        use http::Request;
 
         #[test]
         fn test_client_handshake() {
@@ -560,7 +582,7 @@ mod tests {
     mod read_tcp_request_message_tests {
         use std::io::Cursor;
 
-        use quinn::VarInt;
+        use crate::VarInt;
 
         use crate::{
             server::connection::read_tcp_request_message, utils::BufMutExt, CLIENT_TCP_REQUEST_ID,
@@ -581,7 +603,7 @@ mod tests {
         #[tokio::test]
         async fn test_read_tcp_request_message_invalid_request_id() {
             let mut buf = bytes::BytesMut::new();
-            buf.put_varint(VarInt::from_u64(0).unwrap());
+            buf.put_varint(VarInt::from_u32(0));
             buf.put_variable_slice(b"test.cc:80\xFF").unwrap();
             buf.put_padding(TCP_REQUEST_PADDING).unwrap();
             let mut stream = Cursor::new(buf.freeze());
@@ -595,7 +617,7 @@ mod tests {
         async fn test_read_tcp_request_message_invalid_address_length() {
             let mut buf = bytes::BytesMut::new();
             buf.put_varint(CLIENT_TCP_REQUEST_ID);
-            buf.put_varint(VarInt::from_u64(0).unwrap());
+            buf.put_varint(VarInt::from_u32(0));
             buf.put_padding(TCP_REQUEST_PADDING).unwrap();
             let mut stream = Cursor::new(buf.freeze());
             let request = read_tcp_request_message(&mut stream).await;

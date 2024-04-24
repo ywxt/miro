@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     future::Future,
     net::SocketAddr,
     sync::{
@@ -10,6 +11,7 @@ use std::{
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use moka::future::Cache;
+use s2n_quic::provider::datagram::default::Sender;
 
 use tokio::{
     net::{ToSocketAddrs, UdpSocket},
@@ -17,6 +19,7 @@ use tokio::{
 };
 
 use crate::{
+    server::ConnectionInfo,
     utils::{self, BoxFuture, BufMutExt},
     DatagramPacketId, DatagramSessionId, Error, ProxyAddress,
 };
@@ -38,18 +41,18 @@ impl DatagramPacket {
     /// This method is used to calculate the sent size of the packet
     ///
     /// The result contains the packet id and fragment description.
-    pub fn sent_size(&self) -> usize {
-        self.header_size() + self.payload.len()
+    pub fn sent_size(&self) -> u64 {
+        self.header_size() + self.payload.len() as u64
     }
 
     /// This method is used to calculate the header size of the packet
     ///
     /// The result contains the packet id and fragment description.
-    pub fn header_size(&self) -> usize {
+    pub fn header_size(&self) -> u64 {
         // Session ID + Packet ID + Fragment ID + Fragment Count
         let mut len = 4 + 2 + 1 + 1;
         len += utils::varint_size(self.address.len() as u64);
-        len += self.address.len();
+        len += self.address.len() as u64;
         len
     }
 }
@@ -66,12 +69,12 @@ struct DatagramFrame<'a> {
 
 impl DatagramFrame<'_> {
     /// This method is used to calculate the sent size of the packet
-    pub fn sent_size(&self) -> usize {
+    pub fn sent_size(&self) -> u64 {
         // Session ID + Packet ID + Fragment ID + Fragment Count
         let mut len = 4 + 2 + 1 + 1;
         len += utils::varint_size(self.address.len() as u64);
-        len += self.address.len();
-        len += self.payload.len();
+        len += self.address.len() as u64;
+        len += self.payload.len() as u64;
         len
     }
 }
@@ -219,21 +222,13 @@ pub struct DatagramSocket {
 impl DatagramSocket {
     pub async fn bind<A: ToSocketAddrs>(addr: A) -> Result<Self, Error> {
         Ok(Self {
-            socket: Arc::new(
-                UdpSocket::bind(addr)
-                    .await
-                    .map_err(|e| Error::IoError(Arc::new(e)))?,
-            ),
+            socket: Arc::new(UdpSocket::bind(addr).await?),
         })
     }
 
     pub async fn send_to(&self, mut buf: impl Buf, addr: SocketAddr) -> Result<(), Error> {
         while buf.has_remaining() {
-            let len = self
-                .socket
-                .send_to(buf.chunk(), addr)
-                .await
-                .map_err(|e| Error::IoError(Arc::new(e)))?;
+            let len = self.socket.send_to(buf.chunk(), addr).await?;
             buf.advance(len);
         }
         Ok(())
@@ -249,24 +244,32 @@ impl DatagramSocket {
 
     pub async fn recv_from(&self) -> Result<(Bytes, SocketAddr), Error> {
         let mut buf = BytesMut::zeroed(65536);
-        let (len, addr) = self
-            .socket
-            .recv_from(&mut buf[..])
-            .await
-            .map_err(|e| Error::IoError(Arc::new(e)))?;
+        let (len, addr) = self.socket.recv_from(&mut buf[..]).await?;
         buf.truncate(len);
         Ok((buf.freeze(), addr))
     }
 }
 
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum QuicDatagramError {
+    #[error("Quic datagram fragmentation error: max_size: {max_size}, requested_size: {requested_size}, header_size: {header_size}")]
+    QuicDatagramFragmentationError {
+        max_size: u64,
+        requested_size: u64,
+        header_size: u64,
+    },
+    #[error("S2n Quic datagram error: {0}")]
+    S2nQuicDatagramError(Cow<'static, str>),
+}
+
 #[derive(Debug)]
 pub struct DatagramSender {
-    conn: quinn::Connection,
+    conn: s2n_quic::connection::Handle,
     recorded_packet_id: AtomicU16,
 }
 
 impl DatagramSender {
-    pub fn new(conn: quinn::Connection) -> Self {
+    pub fn new(conn: s2n_quic::connection::Handle) -> Self {
         Self {
             conn,
             recorded_packet_id: AtomicU16::new(0),
@@ -276,8 +279,7 @@ impl DatagramSender {
         let packet_id = self.recorded_packet_id.fetch_add(1, Ordering::SeqCst);
         let max_size = self
             .conn
-            .max_datagram_size()
-            .ok_or_else(|| Error::DatagramError(quinn::SendDatagramError::Disabled))?;
+            .query_event_context(|context: &ConnectionInfo| context.max_datagram_size)?;
         for frame in Self::fragment_packet(&packet, packet_id, max_size)? {
             self.send_frame(frame)?;
         }
@@ -287,8 +289,8 @@ impl DatagramSender {
     fn fragment_packet(
         packet: &DatagramPacket,
         packet_id: DatagramPacketId,
-        max_size: usize,
-    ) -> Result<impl Iterator<Item = DatagramFrame<'_>>, Error> {
+        max_size: u64,
+    ) -> Result<impl Iterator<Item = DatagramFrame<'_>>, QuicDatagramError> {
         let packet_len = packet.sent_size();
         if packet_len <= max_size {
             Ok(DatagramFrameIter {
@@ -298,16 +300,25 @@ impl DatagramSender {
                 frame_count: 1,
                 address: &packet.address,
                 payload: packet.payload.clone(),
-                max_size: packet.payload.len(),
+                max_size: packet.payload.len() as u64,
             })
         } else {
             if max_size <= packet.header_size() {
-                return Err(Error::DatagramError(quinn::SendDatagramError::TooLarge));
+                return Err(QuicDatagramError::QuicDatagramFragmentationError {
+                    max_size: max_size as u64,
+                    requested_size: packet_len as u64,
+                    header_size: packet.header_size() as u64,
+                });
             }
-            let max_size = max_size - packet.header_size();
-            let frame_count = (packet.payload.len() + max_size - 1) / max_size;
-            if frame_count > u8::MAX as usize {
-                return Err(Error::DatagramError(quinn::SendDatagramError::TooLarge));
+            let max_payload_size = max_size - packet.header_size();
+            let frame_count =
+                (packet.payload.len() as u64 + max_payload_size - 1) / max_payload_size;
+            if frame_count > u8::MAX as u64 {
+                return Err(QuicDatagramError::QuicDatagramFragmentationError {
+                    max_size: max_size as u64,
+                    requested_size: packet_len as u64,
+                    header_size: packet.header_size() as u64,
+                });
             }
             Ok(DatagramFrameIter {
                 session_id: packet.session_id,
@@ -316,21 +327,32 @@ impl DatagramSender {
                 frame_count: frame_count as u8,
                 address: &packet.address,
                 payload: packet.payload.clone(),
-                max_size,
+                max_size: max_payload_size,
             })
         }
     }
 
     fn send_frame(&self, frame: DatagramFrame<'_>) -> Result<(), Error> {
-        let mut buf = BytesMut::with_capacity(frame.sent_size());
+        let mut buf = BytesMut::with_capacity(frame.sent_size() as usize);
         buf.put_u32(frame.session_id);
         buf.put_u16(frame.packet_id);
         buf.put_u8(frame.frame_id);
         buf.put_u8(frame.frame_count);
         buf.put_proxy_address(frame.address)?;
         buf.put(frame.payload);
-        self.conn.send_datagram(buf.freeze())?;
-        Ok(())
+        let data = buf.freeze();
+        let result = self
+            .conn
+            .datagram_mut(|sender: &mut Sender| sender.send_datagram(data))?;
+
+        match result {
+            Ok(()) => Ok(()),
+            Err(s2n_quic::provider::datagram::default::DatagramError::ConnectionError {
+                error,
+                ..
+            }) => Err(error.into()),
+            Err(e) => Err(QuicDatagramError::S2nQuicDatagramError(e.to_string().into()).into()),
+        }
     }
 }
 
@@ -342,7 +364,7 @@ struct DatagramFrameIter<'a> {
     frame_count: u8,
     address: &'a ProxyAddress,
     payload: Bytes,
-    max_size: usize,
+    max_size: u64,
 }
 
 impl<'a> Iterator for DatagramFrameIter<'a> {
@@ -358,10 +380,10 @@ impl<'a> Iterator for DatagramFrameIter<'a> {
             frame_id: self.frame_id,
             frame_count: self.frame_count,
             address: self.address,
-            payload: if self.max_size > self.payload.remaining() {
+            payload: if self.max_size > self.payload.remaining() as u64 {
                 self.payload.split_off(0)
             } else {
-                self.payload.split_to(self.max_size)
+                self.payload.split_to(self.max_size as usize)
             },
         };
         self.frame_id += 1;
