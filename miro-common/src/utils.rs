@@ -201,8 +201,8 @@ pub fn varint_size(value: u64) -> u64 {
 
 /// Ignore the error if the connection is closed
 pub fn transform_connection_error(
-    err: s2n_quic_core::connection::Error,
-) -> Option<s2n_quic_core::connection::Error> {
+    err: s2n_quic::connection::Error,
+) -> Option<s2n_quic::connection::Error> {
     match err {
         s2n_quic::connection::Error::Closed { .. } => None,
         s2n_quic::connection::Error::Transport { .. } => None,

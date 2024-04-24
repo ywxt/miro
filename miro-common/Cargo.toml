@@ -8,9 +8,8 @@ edition = "2021"
 [dependencies]
 tokio.workspace = true
 
-s2n-quic = { version = "1.37", features = ["unstable-provider-datagram"] }
+s2n-quic = { version = "1.37", features = ["unstable-provider-datagram", "unstable-congestion-controller"] }
 s2n-quic-h3 = { path = "../submodules/s2n-quic-h3" }
-s2n-quic-core = "0.37"
 
 http.workspace = true
 

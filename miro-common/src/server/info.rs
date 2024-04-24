@@ -1,5 +1,6 @@
 use s2n_quic::provider::event::Subscriber;
-use s2n_quic_core::transport::parameters::MaxDatagramFrameSize;
+
+const MAX_DATAGRAM_FRAME_SIZE: u64 = 65535;
 
 #[derive(Debug, Clone)]
 pub struct ConnectionInfo {
@@ -13,19 +14,19 @@ impl Subscriber for ConnectionInfoSubscriber {
 
     fn create_connection_context(
         &mut self,
-        _meta: &s2n_quic_core::event::api::ConnectionMeta,
-        _info: &s2n_quic_core::event::api::ConnectionInfo,
+        _meta: &s2n_quic::provider::event::ConnectionMeta,
+        _info: &s2n_quic::provider::event::ConnectionInfo,
     ) -> Self::ConnectionContext {
         ConnectionInfo {
-            max_datagram_size: MaxDatagramFrameSize::RECOMMENDED,
+            max_datagram_size: MAX_DATAGRAM_FRAME_SIZE,
         }
     }
 
     fn on_transport_parameters_received(
         &mut self,
         context: &mut Self::ConnectionContext,
-        _meta: &s2n_quic_core::event::api::ConnectionMeta,
-        event: &s2n_quic_core::event::api::TransportParametersReceived,
+        _meta: &s2n_quic::provider::event::ConnectionMeta,
+        event: &s2n_quic::provider::event::events::TransportParametersReceived,
     ) {
         context.max_datagram_size = event.transport_parameters.max_datagram_frame_size;
     }

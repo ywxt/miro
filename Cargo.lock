@@ -690,7 +690,6 @@ dependencies = [
  "moka",
  "rand 0.8.5",
  "s2n-quic",
- "s2n-quic-core",
  "s2n-quic-h3",
  "thiserror",
  "tokio",
