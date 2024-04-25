@@ -4,6 +4,7 @@ mod padding;
 mod protocol;
 mod utils;
 
+pub mod client;
 pub mod datagram;
 pub mod server;
 

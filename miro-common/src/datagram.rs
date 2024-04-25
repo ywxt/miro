@@ -1,7 +1,6 @@
 use std::{
     borrow::Cow,
     future::Future,
-    net::SocketAddr,
     sync::{
         atomic::{AtomicU16, Ordering},
         Arc,
@@ -13,10 +12,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use moka::future::Cache;
 use s2n_quic::provider::datagram::default::Sender;
 
-use tokio::{
-    net::{ToSocketAddrs, UdpSocket},
-    sync::{mpsc, Mutex},
-};
+use tokio::sync::{mpsc, Mutex};
 
 use crate::{
     server::ConnectionInfo,
@@ -214,42 +210,6 @@ impl DatagramSessionManager {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct DatagramSocket {
-    socket: Arc<UdpSocket>,
-}
-
-impl DatagramSocket {
-    pub async fn bind<A: ToSocketAddrs>(addr: A) -> Result<Self, Error> {
-        Ok(Self {
-            socket: Arc::new(UdpSocket::bind(addr).await?),
-        })
-    }
-
-    pub async fn send_to(&self, mut buf: impl Buf, addr: SocketAddr) -> Result<(), Error> {
-        while buf.has_remaining() {
-            let len = self.socket.send_to(buf.chunk(), addr).await?;
-            buf.advance(len);
-        }
-        Ok(())
-    }
-
-    pub async fn send_to_proxy_address(
-        &self,
-        buf: Bytes,
-        address: ProxyAddress,
-    ) -> Result<(), Error> {
-        self.send_to(buf, address.resolve().await?).await
-    }
-
-    pub async fn recv_from(&self) -> Result<(Bytes, SocketAddr), Error> {
-        let mut buf = BytesMut::zeroed(65536);
-        let (len, addr) = self.socket.recv_from(&mut buf[..]).await?;
-        buf.truncate(len);
-        Ok((buf.freeze(), addr))
-    }
-}
-
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum QuicDatagramError {
     #[error("Quic datagram fragmentation error: max_size: {max_size}, requested_size: {requested_size}, header_size: {header_size}")]
@@ -260,6 +220,14 @@ pub enum QuicDatagramError {
     },
     #[error("S2n Quic datagram error: {0}")]
     S2nQuicDatagramError(Cow<'static, str>),
+    #[error("S2n Quic datagram build error: {0}")]
+    S2nQuicDatagramBuildError(#[from] Arc<s2n_quic::provider::datagram::default::BuilderError>),
+}
+
+impl From<s2n_quic::provider::datagram::default::BuilderError> for QuicDatagramError {
+    fn from(value: s2n_quic::provider::datagram::default::BuilderError) -> Self {
+        Self::S2nQuicDatagramBuildError(Arc::new(value))
+    }
 }
 
 #[derive(Debug)]
@@ -307,7 +275,7 @@ impl DatagramSender {
                 return Err(QuicDatagramError::QuicDatagramFragmentationError {
                     max_size,
                     requested_size: packet_len,
-                    header_size: packet.header_size() ,
+                    header_size: packet.header_size(),
                 });
             }
             let max_payload_size = max_size - packet.header_size();

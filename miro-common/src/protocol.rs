@@ -1,8 +1,6 @@
 use crate::VarInt;
 use bytes::Bytes;
-use std::{net::SocketAddr, num::ParseIntError, ops::Deref, str::FromStr, sync::Arc};
-
-use crate::Error;
+use std::{io, net::SocketAddr, num::ParseIntError, ops::Deref, str::FromStr};
 
 pub const HANDSHAKE_PATH: &str = "/auth";
 pub const HANDSHAKE_HOST: &str = "hysteria";
@@ -23,6 +21,21 @@ pub enum ServerMaxReceiveRate {
     Specified(u32),
 }
 
+impl From<u32> for ServerMaxReceiveRate {
+    fn from(v: u32) -> Self {
+        ServerMaxReceiveRate::Specified(if v == 0 { u32::MAX } else { v })
+    }
+}
+
+impl From<Option<u32>> for ServerMaxReceiveRate {
+    fn from(v: Option<u32>) -> Self {
+        match v {
+            Some(v) => v.into(),
+            None => ServerMaxReceiveRate::Auto,
+        }
+    }
+}
+
 impl FromStr for ServerMaxReceiveRate {
     type Err = ParseIntError;
 
@@ -30,7 +43,8 @@ impl FromStr for ServerMaxReceiveRate {
         if s == "auto" {
             Ok(ServerMaxReceiveRate::Auto)
         } else {
-            s.parse().map(ServerMaxReceiveRate::Specified)
+            s.parse()
+                .map(|v| ServerMaxReceiveRate::Specified(if v == 0 { u32::MAX } else { v }))
         }
     }
 }
@@ -88,12 +102,14 @@ impl ProxyAddress {
         ProxyAddress(s)
     }
 
-    pub async fn resolve(&self) -> Result<SocketAddr, Error> {
+    pub async fn resolve(&self) -> Result<SocketAddr, io::Error> {
         tokio::net::lookup_host(self.0.as_str())
-            .await
-            .map_err(|e| Error::from(Arc::new(e)))?
+            .await?
             .next()
-            .ok_or(Error::AddressResolutionError(self.0.clone().into()))
+            .ok_or(io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "no address found",
+            ))
     }
 
     pub fn as_str(&self) -> &str {

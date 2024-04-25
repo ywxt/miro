@@ -1,41 +1,31 @@
-use std::{future::poll_fn, path::Path};
+use std::{fs, future::poll_fn, path::Path};
 
 use http::{Method, Request};
 use miro_common::{
-    server::Server, AUTH_REQUEST_PADDING, HANDSHAKE_HEADER_AUTH, HANDSHAKE_HEADER_CC_RX,
-    HANDSHAKE_HEADER_PADDING, HANDSHAKE_HEADER_UDP, HANDSHAKE_STATUS_OK,
+    server::{
+        DefaultDatagramProvider, DefaultServer, DefaultStreamProvider, PasswordAuthenticator,
+        ServerConfig,
+    },
+    AUTH_REQUEST_PADDING, HANDSHAKE_HEADER_AUTH, HANDSHAKE_HEADER_CC_RX, HANDSHAKE_HEADER_PADDING,
+    HANDSHAKE_HEADER_UDP, HANDSHAKE_STATUS_OK,
 };
-use s2n_quic::{
-    client::Connect,
-    provider::{datagram::default::Endpoint, tls},
-    Client,
-};
+use s2n_quic::{client::Connect, provider::tls, Client};
 use s2n_quic_h3::h3;
 
 const LOCAL_ADDRESS: &str = "127.0.0.1:0";
-fn create_server() -> Server {
+fn create_server() -> DefaultServer {
     let cert = "tests/server.cert";
     let key = "tests/server.key";
-    let tls_config = tls::default::Server::builder()
-        .with_certificate(Path::new(cert), Path::new(key))
-        .unwrap()
-        .build()
-        .unwrap();
-    let datagram_provider = Endpoint::builder()
-        .with_recv_capacity(200)
-        .unwrap()
-        .build()
-        .unwrap();
-    let server = s2n_quic::Server::builder()
-        .with_tls(tls_config)
-        .unwrap()
-        .with_io(LOCAL_ADDRESS)
-        .unwrap()
-        .with_datagram(datagram_provider)
-        .unwrap()
-        .start()
-        .unwrap();
-    Server::new(server)
+    let cert = fs::read_to_string(cert).unwrap();
+    let key = fs::read_to_string(key).unwrap();
+    let config = ServerConfig::builder()
+        .local_addr(LOCAL_ADDRESS.parse().unwrap())
+        .certificates(vec![(cert, key)])
+        .auth(PasswordAuthenticator::new("Hello"))
+        .datagram_outbound(DefaultDatagramProvider)
+        .stream_outbound(DefaultStreamProvider)
+        .build();
+    DefaultServer::start(config).unwrap()
 }
 
 fn create_client() -> Client {

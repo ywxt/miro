@@ -15,6 +15,12 @@ pub enum Error {
     #[error("S2n Quic query error: {0}")]
     S2nQuicQueryError(#[from] s2n_quic::provider::event::query::Error),
 
+    #[error("S2n TLS error: {0}")]
+    TlsError(#[from] Arc<s2n_quic::provider::tls::default::error::Error>),
+
+    #[error("S2n endpoint start error: {0}")]
+    StartError(#[from] Arc<s2n_quic::provider::StartError>),
+
     #[error("IO error: {0}")]
     IoError(#[from] Arc<std::io::Error>),
 
@@ -33,12 +39,24 @@ pub enum Error {
     #[error("Hysteria handshake failed: {0}")]
     HysteriaHandshakeError(Cow<'static, str>),
 
-    #[error("Hysteria authentication failed")]
-    HysteriaAuthError,
+    #[error("Hysteria authentication failed: {0}")]
+    HysteriaAuthError(Arc<dyn std::error::Error + Send + Sync>),
 }
 
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
         Self::IoError(Arc::new(e))
+    }
+}
+
+impl From<s2n_quic::provider::tls::default::error::Error> for Error {
+    fn from(value: s2n_quic::provider::tls::default::error::Error) -> Self {
+        Self::TlsError(Arc::new(value))
+    }
+}
+
+impl From<s2n_quic::provider::StartError> for Error {
+    fn from(value: s2n_quic::provider::StartError) -> Self {
+        Self::StartError(Arc::new(value))
     }
 }

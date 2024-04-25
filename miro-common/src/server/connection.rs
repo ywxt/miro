@@ -15,36 +15,38 @@ use s2n_quic::{
 };
 use s2n_quic_h3::h3;
 
-use tokio::{
-    io::{AsyncRead, AsyncWrite, AsyncWriteExt},
-    net::TcpStream,
-};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 
 use crate::{
     datagram::{
-        DatagramPacket, DatagramSender, DatagramSessionManager, DatagramSocket, QuicDatagramError,
+        DatagramPacket, DatagramSender, DatagramSessionManager, QuicDatagramError,
         MAX_DATAGRAM_CHANNEL_CAPACITY,
     },
     utils::{transform_connection_error, AsyncReadStreamExt, BoxFuture, BufExt, BufMutExt},
-    ClientHandshake, DatagramFrame, DatagramSessionId, ProxyAddress, ServerHandshake, TcpRequest,
-    TcpResponse, AUTH_RESPONSE_PADDING, CLIENT_TCP_REQUEST_ID, HANDSHAKE_HEADER_AUTH,
-    HANDSHAKE_HEADER_CC_RX, HANDSHAKE_HEADER_PADDING, HANDSHAKE_HEADER_UDP, HANDSHAKE_HOST,
-    HANDSHAKE_PATH, HANDSHAKE_STATUS_OK, SERVER_TCP_RESPONSE_STATUS_OK, TCP_RESPONSE_PADDING,
+    ClientHandshake, DatagramFrame, DatagramSessionId, ProxyAddress, ServerHandshake,
+    ServerMaxReceiveRate, TcpRequest, TcpResponse, AUTH_RESPONSE_PADDING, CLIENT_TCP_REQUEST_ID,
+    HANDSHAKE_HEADER_AUTH, HANDSHAKE_HEADER_CC_RX, HANDSHAKE_HEADER_PADDING, HANDSHAKE_HEADER_UDP,
+    HANDSHAKE_HOST, HANDSHAKE_PATH, HANDSHAKE_STATUS_OK, SERVER_TCP_RESPONSE_STATUS_OK,
+    TCP_RESPONSE_PADDING,
 };
 
-use super::{Authentication, ConnectionConfig, ConnectionConfigBuilder, Error};
+use super::{
+    Authenticator, ConnectionConfig, Error, OutboundDatagramProvider, OutboundStreamProvider,
+};
 
 #[derive(Debug)]
-pub struct Connection {
+pub struct Connection<Auth, OutboundStream, OutboundDatagram> {
     conn: s2n_quic::Connection,
-    config: ConnectionConfig,
+    config: ConnectionConfig<Auth, OutboundStream, OutboundDatagram>,
     session: DatagramSessionManager,
 }
 
-impl Connection {
-    pub fn new(conn: s2n_quic::Connection) -> Self {
-        let config = ConnectionConfigBuilder::new(Authentication::new_password("Hello")).build();
-        let idle_timeout = config.idle_timeout;
+impl<Auth, OutboundStream, OutboundDatagram> Connection<Auth, OutboundStream, OutboundDatagram> {
+    pub(crate) fn new(
+        conn: s2n_quic::Connection,
+        config: ConnectionConfig<Auth, OutboundStream, OutboundDatagram>,
+    ) -> Self {
+        let idle_timeout = config.udp_idle_timeout;
         Self {
             conn,
             config,
@@ -53,10 +55,17 @@ impl Connection {
     }
 }
 
-impl Connection {
-    #[tracing::instrument(level = "info", skip(self), fields(conn.ip = ?self.conn.remote_addr()))]
+impl<
+        Auth: Authenticator,
+        OutboundStream: OutboundStreamProvider,
+        OutboundDatagram: OutboundDatagramProvider,
+    > Connection<Auth, OutboundStream, OutboundDatagram>
+{
+    #[tracing::instrument(level = "info", skip(self), fields(conn.ip = ?self.conn.remote_addr(), conn.id = self.conn.id()))]
     pub async fn process(self) -> Result<(), Error> {
         let conn = self.conn;
+        let local_addr = conn.local_addr()?;
+        let remote_addr = conn.remote_addr()?;
         tracing::info!("Processing connection");
         let mut h3_conn: h3::server::Connection<s2n_quic_h3::Connection, Bytes> =
             h3::server::Connection::new(s2n_quic_h3::Connection::new(conn)).await?;
@@ -72,14 +81,19 @@ impl Connection {
                         return serve_masquerading_http(request, stream, h3_conn).await;
                     }
                 };
-                if !self.config.authenticate(&client_handshake.auth).await? {
+                if !self
+                    .config
+                    .auth
+                    .authenticate(&client_handshake.auth, remote_addr, local_addr)
+                    .await?
+                {
                     tracing::warn!(
                         "Authentication failed, serve the connection as a HTTP connection."
                     );
                     return serve_masquerading_http(request, stream, h3_conn).await;
                 }
                 tracing::debug!("Client authentication succeeded: {:?}", client_handshake);
-                server_handshake(stream, &self.config).await?;
+                server_handshake(stream, self.config.udp, self.config.cc_rx).await?;
                 tracing::info!(
                     "Handshake completed, serve the connection as a Hysteria connection."
                 );
@@ -87,22 +101,29 @@ impl Connection {
                 let bidi_acceptor = &mut h3_conn.inner.conn.bidi_acceptor;
                 let datagram_process = async move {
                     if !self.config.udp {
-                        tracing::debug!("UDP is disabled, skip the UDP transport process.");
+                        tracing::info!("UDP is disabled, skip the UDP transport process.");
                         return Ok::<(), Error>(());
                     }
                     loop {
-                        if !Self::receive_datagram(conn.clone(), &self.session, &self.config)
-                            .await?
+                        if !Self::receive_datagram(
+                            conn.clone(),
+                            self.session.clone(),
+                            self.config.udp_idle_timeout,
+                            self.config.datagram_outbound.clone(),
+                        )
+                        .await?
                         {
-                            tracing::debug!("Connection closed");
+                            tracing::info!("Connection closed");
                             return Ok(());
                         }
                     }
                 };
                 let stream_process = async move {
                     loop {
-                        if !Self::receive_stream(bidi_acceptor).await? {
-                            tracing::info!("Connection closed");
+                        if !Self::receive_stream(bidi_acceptor, self.config.stream_outbound.clone())
+                            .await?
+                        {
+                            tracing::debug!("Connection closed");
                             return Ok(());
                         }
                     }
@@ -123,8 +144,9 @@ impl Connection {
     /// Returns `true` if the connection is still alive, `false` if the connection is closed.
     async fn receive_datagram(
         conn: Handle,
-        session_cache: &DatagramSessionManager,
-        config: &ConnectionConfig,
+        session_cache: DatagramSessionManager,
+        idle_timeout: Duration,
+        out_datagram_provider: Arc<OutboundDatagram>,
     ) -> Result<bool, Error> {
         let datagram = ReceiveDatagram { conn: &conn }.await;
         let datagram = match datagram {
@@ -138,10 +160,17 @@ impl Connection {
             }
             Err(e) => return Err(e),
         };
-        let idle_timeout = config.idle_timeout;
         let session_cache = session_cache.clone();
         tokio::spawn(async move {
-            if let Err(e) = process_udp_message(session_cache, conn, datagram, idle_timeout).await {
+            if let Err(e) = process_udp_message(
+                session_cache,
+                conn,
+                datagram,
+                idle_timeout,
+                out_datagram_provider.as_ref(),
+            )
+            .await
+            {
                 tracing::warn!("Error processing UDP message: {}", e);
             }
         });
@@ -149,12 +178,17 @@ impl Connection {
     }
 
     /// Returns `true` if the connection is still alive, `false` if the connection is closed.
-    async fn receive_stream(acceptor: &mut BidirectionalStreamAcceptor) -> Result<bool, Error> {
+    async fn receive_stream(
+        acceptor: &mut BidirectionalStreamAcceptor,
+        stream_outbound: Arc<OutboundStream>,
+    ) -> Result<bool, Error> {
         match acceptor.accept_bidirectional_stream().await {
             Ok(Some(stream)) => {
                 let (recv, send) = stream.split();
                 tokio::spawn(async move {
-                    if let Err(e) = process_tcp_request_message(recv, send).await {
+                    if let Err(e) =
+                        process_tcp_request_message(recv, send, stream_outbound.as_ref()).await
+                    {
                         tracing::warn!("Error processing TCP request: {}", e);
                     }
                 });
@@ -191,9 +225,11 @@ impl Future for ReceiveDatagram<'_> {
 
         match datagram {
             Poll::Ready(Ok(datagram)) => Poll::Ready(Ok(datagram)),
-            Poll::Ready(Err(s2n_quic::provider::datagram::default::DatagramError::ConnectionError { error, .. })) => {
-                Poll::Ready(Err(Error::QuicConnectionError(error)))
-            }
+            Poll::Ready(Err(
+                s2n_quic::provider::datagram::default::DatagramError::ConnectionError {
+                    error, ..
+                },
+            )) => Poll::Ready(Err(Error::QuicConnectionError(error))),
             Poll::Ready(Err(e)) => Poll::Ready(Err(QuicDatagramError::S2nQuicDatagramError(
                 e.to_string().into(),
             ))?),
@@ -284,11 +320,12 @@ async fn send_404<S: h3::quic::SendStream<B>, B: bytes::Buf>(
 #[tracing::instrument(level = "debug", skip(stream))]
 async fn server_handshake<S: h3::quic::SendStream<B>, B: bytes::Buf>(
     mut stream: h3::server::RequestStream<S, B>,
-    config: &ConnectionConfig,
+    udp_enabled: bool,
+    cc_rx: ServerMaxReceiveRate,
 ) -> Result<(), Error> {
     let response = ServerHandshake {
-        udp: config.udp,
-        cc_rx: config.cc_rx.clone(),
+        udp: udp_enabled,
+        cc_rx,
     };
     let response = build_server_handshake(response);
     stream.send_response(response).await?;
@@ -296,10 +333,11 @@ async fn server_handshake<S: h3::quic::SendStream<B>, B: bytes::Buf>(
     Ok(())
 }
 
-#[tracing::instrument(level = "debug", skip(recv_stream, send_stream))]
+#[tracing::instrument(level = "debug", skip(recv_stream, send_stream, stream_outbound))]
 async fn process_tcp_request_message(
     mut recv_stream: impl AsyncRead + Unpin,
     mut send_stream: impl AsyncWrite + Unpin,
+    stream_outbound: &impl OutboundStreamProvider,
 ) -> Result<(), Error> {
     let request = read_tcp_request_message(&mut recv_stream).await?;
     tracing::debug!("Received TCP request: {:?}", request);
@@ -308,9 +346,7 @@ async fn process_tcp_request_message(
         message: "Miro".into(),
     };
     send_tcp_response_message(&mut send_stream, response).await?;
-    let addr = request.address.resolve().await?;
-    let outbound_stream = TcpStream::connect(addr).await?;
-    let (mut outbound_read, mut outbound_write) = outbound_stream.into_split();
+    let (mut outbound_read, mut outbound_write) = stream_outbound.direct(&request.address).await?;
     tokio::try_join!(
         tokio::io::copy(&mut recv_stream, &mut outbound_write),
         tokio::io::copy(&mut outbound_read, &mut send_stream)
@@ -348,12 +384,13 @@ async fn send_tcp_response_message(
         .map_err(|e| Error::from(Arc::new(e)))
 }
 
-#[tracing::instrument(level = "debug", skip(cache, message))]
+#[tracing::instrument(level = "debug", skip(cache, message, out_datagram_provider))]
 async fn process_udp_message(
     cache: DatagramSessionManager,
     conn: s2n_quic::connection::Handle,
     message: Bytes,
     idle_timeout: Duration,
+    out_datagram_provider: &impl OutboundDatagramProvider,
 ) -> Result<(), Error> {
     let frame = read_datagram_frame(message)?;
     if let Some(_data) = cache
@@ -380,6 +417,7 @@ async fn process_udp_message(
                 &frame.address,
                 idle_timeout,
                 cache.get_session_invalidate_fn(),
+                out_datagram_provider,
             )
             .await?;
             Ok(sender)
@@ -430,14 +468,16 @@ async fn crate_udp_and_transport(
     addr: &ProxyAddress,
     idle_timeout: Duration,
     invalidate_fn: impl FnOnce(DatagramSessionId) -> BoxFuture<()> + Send + 'static,
+    out_datagram_provider: &impl OutboundDatagramProvider,
 ) -> Result<(), Error> {
+    use crate::server::outbound::DatagramSocket;
     let addr = addr.resolve().await?;
     let local_addr = if addr.is_ipv4() {
         "127.0.0.1:0"
     } else {
         "[::1]:0"
     };
-    let udp = DatagramSocket::bind(local_addr).await?;
+    let udp = out_datagram_provider.direct(local_addr).await?;
     tokio::spawn(async move {
         let result = async move {
             let packet_sender = Arc::new(DatagramSender::new(connection));
