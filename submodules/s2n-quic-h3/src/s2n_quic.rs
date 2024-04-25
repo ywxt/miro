@@ -30,7 +30,6 @@ impl Connection {
             recv_acceptor: recv,
         }
     }
-
 }
 
 #[derive(Debug, Clone)]

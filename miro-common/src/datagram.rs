@@ -305,9 +305,9 @@ impl DatagramSender {
         } else {
             if max_size <= packet.header_size() {
                 return Err(QuicDatagramError::QuicDatagramFragmentationError {
-                    max_size: max_size as u64,
-                    requested_size: packet_len as u64,
-                    header_size: packet.header_size() as u64,
+                    max_size,
+                    requested_size: packet_len,
+                    header_size: packet.header_size() ,
                 });
             }
             let max_payload_size = max_size - packet.header_size();
@@ -315,9 +315,9 @@ impl DatagramSender {
                 (packet.payload.len() as u64 + max_payload_size - 1) / max_payload_size;
             if frame_count > u8::MAX as u64 {
                 return Err(QuicDatagramError::QuicDatagramFragmentationError {
-                    max_size: max_size as u64,
-                    requested_size: packet_len as u64,
-                    header_size: packet.header_size() as u64,
+                    max_size,
+                    requested_size: packet_len,
+                    header_size: packet.header_size(),
                 });
             }
             Ok(DatagramFrameIter {

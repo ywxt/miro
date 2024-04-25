@@ -1,9 +1,8 @@
 use std::{cmp::max, time::Duration};
 
 use s2n_quic::provider::congestion_controller::{
-    self, CongestionController, Publisher, RandomGenerator, RttEstimator, Timestamp
+    self, CongestionController, Publisher, RandomGenerator, RttEstimator, Timestamp,
 };
-
 
 const MAX_BURST_PACKETS: u64 = 10;
 const MAX_BURST_PACING_DELAY_MULTIPLIER: u64 = 4;
@@ -78,11 +77,10 @@ impl Pacer {
         }
         Some(
             self.last_sent
-                .clone()
                 .unwrap_or_else(|| unsafe {
                     Timestamp::from_duration(std::time::Duration::from_secs(0))
                 })
-                .checked_add(Duration::from_nanos(d as u64))
+                .checked_add(Duration::from_nanos(d))
                 .unwrap_or_else(|| unsafe { Timestamp::from_duration(std::time::Duration::MAX) }),
         )
     }
@@ -250,7 +248,7 @@ impl CongestionController for Brutal {
             self.lost_info[slot].lost_count = lost_bytes as u64;
         }
         self.update_ack_rate(timestamp);
-        self.bytes_in_flight -= lost_bytes as u32;
+        self.bytes_in_flight -= lost_bytes;
     }
 
     fn on_explicit_congestion<Pub: Publisher>(
@@ -276,14 +274,17 @@ impl CongestionController for Brutal {
 }
 
 #[derive(Debug, Clone)]
-pub (crate) struct HysteriaCongestionEndpoint {
-    bps_receiver: tokio::sync::watch::Receiver<u64>,
+pub(crate) struct HysteriaCongestionEndpoint {
+    _bps_receiver: tokio::sync::watch::Receiver<u64>,
 }
 
 impl congestion_controller::Endpoint for HysteriaCongestionEndpoint {
     type CongestionController = Brutal;
 
-    fn new_congestion_controller(&mut self, path_info: congestion_controller::PathInfo) -> Self::CongestionController {
+    fn new_congestion_controller(
+        &mut self,
+        _path_info: congestion_controller::PathInfo,
+    ) -> Self::CongestionController {
         todo!()
     }
-} 
+}

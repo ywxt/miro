@@ -1,4 +1,11 @@
-use std::{borrow::Cow, sync::Arc, time::Duration};
+use std::{
+    borrow::Cow,
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use bytes::{BufMut, Bytes};
 use http::{Method, Request, Response, Version};
@@ -15,7 +22,7 @@ use tokio::{
 
 use crate::{
     datagram::{
-        DatagramPacket, DatagramSender, DatagramSessionManager, DatagramSocket,
+        DatagramPacket, DatagramSender, DatagramSessionManager, DatagramSocket, QuicDatagramError,
         MAX_DATAGRAM_CHANNEL_CAPACITY,
     },
     utils::{transform_connection_error, AsyncReadStreamExt, BoxFuture, BufExt, BufMutExt},
@@ -78,22 +85,32 @@ impl Connection {
                 );
                 let conn = &mut h3_conn.inner.conn.conn;
                 let bidi_acceptor = &mut h3_conn.inner.conn.bidi_acceptor;
-                loop {
-                    // Datagram
-                    Self::receive_datagram(conn.clone(), &self.session, &self.config)?;
-                    // Stream
-                    if let Err(err) = Self::receive_stream(bidi_acceptor).await {
-                        // Ignore connection closed error and stop the loop
-                        if let Some(err) = transform_connection_error(err) {
-                            return Err(err)?;
-                        } else {
-                            break;
+                let datagram_process = async move {
+                    if !self.config.udp {
+                        tracing::debug!("UDP is disabled, skip the UDP transport process.");
+                        return Ok::<(), Error>(());
+                    }
+                    loop {
+                        if !Self::receive_datagram(conn.clone(), &self.session, &self.config)
+                            .await?
+                        {
+                            tracing::debug!("Connection closed");
+                            return Ok(());
                         }
                     }
-                }
+                };
+                let stream_process = async move {
+                    loop {
+                        if !Self::receive_stream(bidi_acceptor).await? {
+                            tracing::info!("Connection closed");
+                            return Ok(());
+                        }
+                    }
+                };
+                tokio::try_join!(datagram_process, stream_process)?;
             }
             Ok(None) => {
-                tracing::info!("No request received");
+                tracing::debug!("No request received");
             }
             Err(e) => {
                 tracing::warn!("Error accepting request: {}", e);
@@ -103,27 +120,24 @@ impl Connection {
         Ok(())
     }
 
-    fn receive_datagram(
+    /// Returns `true` if the connection is still alive, `false` if the connection is closed.
+    async fn receive_datagram(
         conn: Handle,
         session_cache: &DatagramSessionManager,
         config: &ConnectionConfig,
-    ) -> Result<(), Error> {
-        let datagram = conn.datagram_mut(|receiver: &mut Receiver| receiver.recv_datagram());
+    ) -> Result<bool, Error> {
+        let datagram = ReceiveDatagram { conn: &conn }.await;
         let datagram = match datagram {
-            Ok(Some(datagram)) => datagram,
-            Ok(None) => {
-                return Ok(());
+            Ok(datagram) => datagram,
+            Err(Error::QuicConnectionError(e)) => {
+                if let Some(err) = transform_connection_error(e) {
+                    return Err(err)?;
+                } else {
+                    return Ok(false);
+                }
             }
-            Err(e) => {
-                tracing::warn!("Error accepting datagram: {}", e);
-                return Err(Error::from(e))?;
-            }
+            Err(e) => return Err(e),
         };
-        if !config.udp {
-            tracing::info!("UDP is disabled, drop the packet");
-            return Ok(());
-        }
-        let conn = conn.clone();
         let idle_timeout = config.idle_timeout;
         let session_cache = session_cache.clone();
         tokio::spawn(async move {
@@ -131,12 +145,11 @@ impl Connection {
                 tracing::warn!("Error processing UDP message: {}", e);
             }
         });
-        Ok(())
+        Ok(true)
     }
 
-    async fn receive_stream(
-        acceptor: &mut BidirectionalStreamAcceptor,
-    ) -> Result<(), s2n_quic::connection::Error> {
+    /// Returns `true` if the connection is still alive, `false` if the connection is closed.
+    async fn receive_stream(acceptor: &mut BidirectionalStreamAcceptor) -> Result<bool, Error> {
         match acceptor.accept_bidirectional_stream().await {
             Ok(Some(stream)) => {
                 let (recv, send) = stream.split();
@@ -145,16 +158,47 @@ impl Connection {
                         tracing::warn!("Error processing TCP request: {}", e);
                     }
                 });
+                Ok(true)
             }
-            Ok(None) => {
-                tracing::info!("Connection closed");
-            }
+            Ok(None) => Ok(false),
             Err(e) => {
-                tracing::warn!("Error accepting stream: {}", e);
-                return Err(e);
+                if let Some(err) = transform_connection_error(e) {
+                    Err(err)?
+                } else {
+                    Ok(false)
+                }
             }
         }
-        Ok(())
+    }
+}
+
+struct ReceiveDatagram<'a> {
+    conn: &'a Handle,
+}
+
+impl Future for ReceiveDatagram<'_> {
+    type Output = Result<Bytes, Error>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let datagram = this
+            .conn
+            .datagram_mut(|receiver: &mut Receiver| receiver.poll_recv_datagram(cx));
+        let datagram = match datagram {
+            Ok(poll) => poll,
+            Err(e) => return Poll::Ready(Err(e)?),
+        };
+
+        match datagram {
+            Poll::Ready(Ok(datagram)) => Poll::Ready(Ok(datagram)),
+            Poll::Ready(Err(s2n_quic::provider::datagram::default::DatagramError::ConnectionError { error, .. })) => {
+                Poll::Ready(Err(Error::QuicConnectionError(error)))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(QuicDatagramError::S2nQuicDatagramError(
+                e.to_string().into(),
+            ))?),
+            Poll::Pending => Poll::Pending,
+        }
     }
 }
 
@@ -265,18 +309,13 @@ async fn process_tcp_request_message(
     };
     send_tcp_response_message(&mut send_stream, response).await?;
     let addr = request.address.resolve().await?;
-    let outbound_stream = TcpStream::connect(addr)
-        .await
-        .map_err(|e| Error::IoError(Arc::new(e)))?;
+    let outbound_stream = TcpStream::connect(addr).await?;
     let (mut outbound_read, mut outbound_write) = outbound_stream.into_split();
-    let result = tokio::join!(
+    tokio::try_join!(
         tokio::io::copy(&mut recv_stream, &mut outbound_write),
         tokio::io::copy(&mut outbound_read, &mut send_stream)
-    );
-    match result {
-        (Ok(_), Ok(_)) => Ok(()),
-        (Err(e), _) | (_, Err(e)) => Err(Error::IoError(Arc::new(e))),
-    }
+    )?;
+    Ok(())
 }
 
 async fn read_tcp_request_message(

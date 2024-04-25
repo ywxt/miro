@@ -102,7 +102,6 @@ async fn test_server_handshake() {
     tokio::join!(request, driver);
     client.wait_idle().await.unwrap();
     handler.await.unwrap();
-     
 }
 
 #[tokio::test(flavor = "multi_thread")]
